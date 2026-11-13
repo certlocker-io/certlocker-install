@@ -1,0 +1,67 @@
+---
+- name: Prepare both HAProxy targets for the existing Trust certificate automation
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    certificate_user: cl-cert-deploy
+  tasks:
+    - name: Require only the public part of the company deployment identity
+      ansible.builtin.assert:
+        that:
+          - vault_certlocker_certificate_deploy_public_key is match('^ssh-rsa [A-Za-z0-9+/=]+$')
+          - uncloud_company is match('^[a-z0-9][a-z0-9-]{0,62}$')
+
+    - name: Create a dedicated certificate deployment account
+      ansible.builtin.user:
+        name: "{{ certificate_user }}"
+        system: true
+        create_home: true
+        shell: /bin/sh
+        password_lock: true
+
+    - name: Allow the company automation key without SSH forwarding
+      ansible.posix.authorized_key:
+        user: "{{ certificate_user }}"
+        key: "{{ vault_certlocker_certificate_deploy_public_key }}"
+        key_options: 'restrict'
+
+    - name: Restore the bounded memory-backed certificate inbox after reboot
+      ansible.builtin.copy:
+        dest: "/etc/tmpfiles.d/certlocker-{{ uncloud_company }}-certificate.conf"
+        mode: '0644'
+        content: |
+          d /run/certlocker-certificate-inbox 0711 root root -
+          d /run/certlocker-certificate-inbox/{{ uncloud_company }} 0700 {{ certificate_user }} {{ certificate_user }} -
+
+    - name: Create the inbox immediately
+      ansible.builtin.command: "systemd-tmpfiles --create /etc/tmpfiles.d/certlocker-{{ uncloud_company }}-certificate.conf"
+
+    - name: Create the private certificate activation configuration directory
+      ansible.builtin.file:
+        path: "/etc/certlocker/{{ uncloud_company }}"
+        state: directory
+        mode: '0700'
+
+    - name: Pin the UI hostnames this automation is allowed to serve
+      ansible.builtin.copy:
+        dest: "/etc/certlocker/{{ uncloud_company }}/certificate.json"
+        mode: '0600'
+        content: "{{ {'hostnames': [uncloud_ingress_settings.hostname, uncloud_ingress_settings.backoffice_hostname]} | to_json }}"
+
+    - name: Install the bounded activation and validation helpers
+      ansible.builtin.copy:
+        src: "{{ item.source }}"
+        dest: "/usr/local/sbin/{{ item.name }}"
+        mode: '0755'
+      loop:
+        - {source: ops/files/uncloud_certificate_activate.py, name: certlocker-certificate-activate}
+        - {source: ../scripts/certlocker-fetch-haproxy-pem.py, name: uncloud_certificate_bundle.py}
+
+    - name: Allow only activation of this company's staged certificate
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/certlocker-{{ uncloud_company }}-certificate"
+        mode: '0440'
+        validate: /usr/sbin/visudo -cf %s
+        content: "{{ certificate_user }} ALL=(root) NOPASSWD: /usr/local/sbin/certlocker-certificate-activate --company {{ uncloud_company }}\n"

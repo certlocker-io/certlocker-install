@@ -1,0 +1,283 @@
+---
+- name: Prepare the pinned application release using company Trust lookups
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    app_root: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps"
+    runtime_secrets: "/run/certlocker/{{ uncloud_company }}"
+    certlocker_dataservice_application_config_source: resolved
+    certlocker_dataservice_jdbc_url: 'jdbc:postgresql://127.0.0.1:5432/certlocker?connectTimeout=3&loginTimeout=5&tcpKeepAlive=true'
+    certlocker_edge_guacd_host: "{{ uncloud_mesh_ip }}"
+  tasks:
+    - name: Require company-owned inventory and its pinned manifest
+      ansible.builtin.assert:
+        that:
+          - uncloud_company is match('^[a-z0-9][a-z0-9-]{0,62}$')
+          - groups['uncloud'] | sort == [groups['uncloud'][0], groups['uncloud'][1]]
+          - uncloud_deployment in ['dev', 'prod']
+
+    - name: Load the immutable company release manifest
+      ansible.builtin.set_fact:
+        uncloud_release_manifest: "{{ lookup('file', inventory_dir ~ '/release.json') | from_json }}"
+
+    - name: Require Trust-backed application configuration
+      ansible.builtin.assert:
+        that:
+          - vault_certlocker_master_key is match('^[A-Za-z0-9+/]{43}=$')
+          - vault_certlocker_postgres_password | length > 0
+          - vault_certlocker_stack_env_key | length >= 32
+          - uncloud_registry_mode | default('ghcr') == 'gcp' or vault_cr_pat | default('') | length > 0
+          - vault_certlocker_application_settings is mapping
+      no_log: true
+
+    - name: Create the private application directory
+      ansible.builtin.file:
+        path: "{{ app_root }}"
+        state: directory
+        mode: '0700'
+
+    - name: Install the candidate manifest for independent rolling health gates
+      ansible.builtin.copy:
+        src: "{{ inventory_dir }}/release.json"
+        dest: "{{ app_root }}/release.json"
+        mode: '0600'
+
+    - name: Create memory-backed runtime secret directory
+      ansible.builtin.file:
+        path: "{{ runtime_secrets }}"
+        state: directory
+        mode: '0700'
+
+    - name: Verify runtime secrets are on tmpfs
+      ansible.builtin.command: "findmnt -n -o FSTYPE -T {{ runtime_secrets }}"
+      register: uncloud_runtime_filesystem
+      changed_when: false
+      failed_when: uncloud_runtime_filesystem.stdout | trim != 'tmpfs'
+
+    - name: Inspect runtime bind paths after a cold start
+      ansible.builtin.stat:
+        path: "{{ runtime_secrets }}/{{ item }}"
+      loop: [dataservice.application.json, postgres, smtp, internal-service-key]
+      register: uncloud_runtime_bind_paths
+
+    - name: Remove only empty Docker-created bind-file directories before rehydration
+      ansible.builtin.command:
+        argv: [rmdir, --, "{{ runtime_secrets }}/{{ item.item }}"]
+      loop: "{{ uncloud_runtime_bind_paths.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.stat.isdir | default(false)
+
+    - name: Check existing dataservice master-key configuration before replacement
+      ansible.builtin.stat:
+        path: "{{ runtime_secrets }}/dataservice.application.json"
+      register: uncloud_existing_dataservice_config
+
+    - name: Read existing master-key configuration only into Ansible memory
+      ansible.builtin.slurp:
+        src: "{{ runtime_secrets }}/dataservice.application.json"
+      register: uncloud_existing_dataservice_payload
+      when: uncloud_existing_dataservice_config.stat.exists
+      no_log: true
+
+    - name: Check durable master-key fingerprint after a possible host reboot
+      ansible.builtin.stat:
+        path: "{{ app_root }}/master-key.sha256"
+      register: uncloud_key_fingerprint
+
+    - name: Read only the durable key fingerprint
+      ansible.builtin.slurp:
+        src: "{{ app_root }}/master-key.sha256"
+      register: uncloud_key_fingerprint_payload
+      when: uncloud_key_fingerprint.stat.exists
+      no_log: true
+
+    - name: Require Trust key continuity before rehydrating runtime secrets
+      ansible.builtin.assert:
+        that:
+          - uncloud_key_fingerprint_payload.content | b64decode | trim == vault_certlocker_master_key | hash('sha256')
+      when: uncloud_key_fingerprint.stat.exists
+      no_log: true
+
+    - name: Refuse accidental master-key rotation on repeat setup or release deployment
+      ansible.builtin.assert:
+        that:
+          - (uncloud_existing_dataservice_payload.content | b64decode | from_json).master_key == vault_certlocker_master_key
+      when: uncloud_existing_dataservice_config.stat.exists
+      no_log: true
+
+    - name: Render V5 resolved dataservice config from company Trust values
+      ansible.builtin.template:
+        src: ../roles/certlocker_stack/templates/dataservice.application.json.j2
+        dest: "{{ runtime_secrets }}/dataservice.application.json"
+        mode: '0400'
+      no_log: true
+
+    - name: Preserve the non-secret master-key continuity fingerprint
+      ansible.builtin.copy:
+        dest: "{{ app_root }}/master-key.sha256"
+        content: "{{ vault_certlocker_master_key | hash('sha256') }}\n"
+        mode: '0600'
+      no_log: true
+
+    - name: Materialize only required password files in tmpfs
+      ansible.builtin.copy:
+        dest: "{{ runtime_secrets }}/{{ item.name }}"
+        content: "{{ item.value }}"
+        mode: '0400'
+      loop:
+        - {name: postgres, value: "{{ vault_certlocker_postgres_password }}"}
+        - {name: smtp, value: "{{ vault_certlocker_dataservice_smtp_pass }}"}
+        - {name: internal-service-key, value: "{{ vault_certlocker_stack_env_key }}"}
+      no_log: true
+
+    - name: Render application Compose without secret values
+      ansible.builtin.template:
+        src: ../uncloud/apps/compose.yaml.j2
+        dest: "{{ app_root }}/compose.yaml"
+        mode: '0600'
+
+    - name: Seed non-secret HA routing state once and preserve elected role on repeat setup
+      ansible.builtin.copy:
+        dest: "{{ app_root }}/.env"
+        force: false
+        mode: '0600'
+        content: |
+          HA_ROUTER_IP={{ hostvars[groups['uncloud'][0]].uncloud_mesh_ip }}
+          HA_DB_ROLE={{ 'ha-primary' if inventory_hostname == groups['uncloud'][0] else 'ha-secondary' }}
+          HA_DATABASE_ROOT=/opt/certlocker/uncloud-db
+          HA_ROUTER_PROXY=1
+
+    - name: Persist the application ownership mode for setup and subsequent releases
+      ansible.builtin.lineinfile:
+        path: "{{ app_root }}/.env"
+        regexp: '^HA_API_SINGLE_OWNER='
+        line: "HA_API_SINGLE_OWNER={{ '1' if uncloud_api_single_owner | default(true) | bool else '0' }}"
+        mode: '0600'
+
+    - name: Render company backoffice domain configuration
+      ansible.builtin.template:
+        src: ../uncloud/apps/backoffice.application.json.j2
+        dest: "{{ app_root }}/backoffice.application.json"
+        mode: '0600'
+
+    - name: Install existing frontend routing configuration
+      ansible.builtin.copy:
+        src: "../certlocker-stack/{{ item.source }}/nginx.conf"
+        dest: "{{ app_root }}/{{ item.service }}.nginx.conf"
+        mode: '0600'
+      loop:
+        - {source: cl, service: ui}
+        - {source: bo, service: backoffice-ui}
+
+    - name: Validate application Compose without printing expanded config
+      ansible.builtin.command:
+        cmd: docker compose config --quiet
+        chdir: "{{ app_root }}"
+      changed_when: false
+
+    - name: Stage every immutable image without saving registry passwords
+      ansible.builtin.include_tasks: uncloud_image_pull.yml
+      vars:
+        uncloud_pull_argv: [docker, compose, --profile, ha-primary, --profile, owned-api, pull, --quiet]
+
+- import_playbook: uncloud_runtime_secrets.yml
+
+- name: Initialize the fresh application database through the verified primary
+  hosts: "{{ groups['uncloud'][0] }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Preserve and validate a private database rollback archive before release updates
+      ansible.builtin.shell: |
+        set -eu
+        backup="/var/lib/certlocker/maintenance/{{ uncloud_company }}-release-$(date -u +%Y%m%dT%H%M%SZ)"
+        install -d -m 0700 "$backup"
+        test ! -e "$backup/database.dump"
+        umask 077
+        docker exec certlocker-uncloud-postgres bash -ec '
+          export PGPASSWORD="$(cat /run/lab-secrets/postgres)" PGSSLMODE=require
+          exec pg_dump -h 127.0.0.1 -U postgres -d certlocker --format=custom' > "$backup/database.dump"
+        docker exec -i certlocker-uncloud-postgres pg_restore --list < "$backup/database.dump" >/dev/null
+      when: uncloud_apps_release_only | default(false) | bool
+      no_log: true
+
+    - name: Create the application database only if absent
+      ansible.builtin.shell: |
+        docker exec certlocker-uncloud-postgres bash -ec '
+          export PGPASSWORD="$(cat /run/lab-secrets/postgres)" PGSSLMODE=require
+          exists=$(psql -h 127.0.0.1 -U postgres -d postgres -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM pg_database WHERE datname='\''certlocker'\''")
+          if [ "$exists" = 0 ]; then
+            createdb -h 127.0.0.1 -U postgres certlocker
+            echo created
+          fi'
+      register: uncloud_application_database
+      changed_when: "'created' in uncloud_application_database.stdout"
+      when: not (uncloud_apps_release_only | default(false) | bool)
+      no_log: true
+
+- name: Start or update the first application node in dependency order
+  hosts: "{{ groups['uncloud'][0] }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Start one application dependency and require health before proceeding
+      ansible.builtin.command:
+        cmd: "docker compose up -d --no-deps --wait --wait-timeout 300 {{ item }}"
+        chdir: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps"
+      loop: [router, guacd, dataservice, gateway, bastion-server, edge, backoffice-api, ui, backoffice-ui]
+      register: uncloud_app_start
+      changed_when: "'Started' in uncloud_app_start.stderr or 'Created' in uncloud_app_start.stderr or 'Recreated' in uncloud_app_start.stderr"
+      when:
+        - not (uncloud_apps_release_only | default(false) | bool)
+        - not (uncloud_api_single_owner | default(true) | bool) or item not in ['edge', 'backoffice-api']
+
+- name: Start or update the second application node after initial migrations
+  hosts: "{{ groups['uncloud'][1] }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Start each application dependency and require health
+      ansible.builtin.command:
+        cmd: "docker compose up -d --no-deps --wait --wait-timeout 300 {{ item }}"
+        chdir: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps"
+      loop: [guacd, dataservice, gateway, bastion-server, edge, backoffice-api, ui, backoffice-ui]
+      when: not (uncloud_api_single_owner | default(true) | bool) or item not in ['edge', 'backoffice-api']
+      register: uncloud_app_start
+      changed_when: "'Started' in uncloud_app_start.stderr or 'Created' in uncloud_app_start.stderr or 'Recreated' in uncloud_app_start.stderr"
+
+    - name: Require secondary HTTP, frontend and ACTIVE registration health before updating primary
+      ansible.builtin.script:
+        cmd: >-
+          ops/files/uncloud_apps_verify.py
+          --company {{ uncloud_company }}
+          --mesh-ip {{ uncloud_mesh_ip }}
+          --router-ip {{ hostvars[groups['uncloud'][0]].uncloud_mesh_ip }}
+          --peer-ip {{ hostvars[groups['uncloud'][0]].uncloud_mesh_ip }}
+          --manifest /opt/certlocker/{{ uncloud_company }}/uncloud-apps/release.json
+          --node-only
+        executable: /usr/bin/python3
+      changed_when: false
+      when: uncloud_apps_release_only | default(false) | bool
+
+- name: Update the primary application node after the secondary release passes startup
+  hosts: "{{ groups['uncloud'][0] }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Update primary applications with the shared Router last
+      ansible.builtin.command:
+        cmd: "docker compose up -d --no-deps --wait --wait-timeout 300 {{ item }}"
+        chdir: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps"
+      loop: [guacd, dataservice, gateway, bastion-server, edge, backoffice-api, ui, backoffice-ui, router]
+      register: uncloud_app_start
+      changed_when: "'Started' in uncloud_app_start.stderr or 'Created' in uncloud_app_start.stderr or 'Recreated' in uncloud_app_start.stderr"
+      when:
+        - uncloud_apps_release_only | default(false) | bool
+        - not (uncloud_api_single_owner | default(true) | bool) or item not in ['edge', 'backoffice-api']

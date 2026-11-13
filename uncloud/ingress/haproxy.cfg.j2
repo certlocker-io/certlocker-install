@@ -1,0 +1,86 @@
+global
+    log stdout format raw local0
+    stats socket /run/haproxy/admin.sock mode 600 level admin
+    maxconn 2048
+
+defaults
+    mode http
+    log global
+    option httplog
+    timeout connect 3s
+    timeout client 60s
+    timeout server 60s
+    timeout tunnel 1h
+    default-server inter 2s fall 2 rise 2
+
+frontend redirect_http
+    bind :80
+    http-request redirect scheme https code 308
+
+frontend https
+    bind :443 ssl crt /run/secrets/ingress.pem alpn h2,http/1.1
+    http-request set-header X-Forwarded-Proto https
+    # Normalize client identity before counting requests or forwarding headers.
+    acl from_cloudflare src -m ip 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 104.16.0.0/13 104.24.0.0/14 108.162.192.0/18 131.0.72.0/22 141.101.64.0/18 162.158.0.0/15 172.64.0.0/13 173.245.48.0/20 188.114.96.0/20 190.93.240.0/20 197.234.240.0/22 198.41.128.0/17 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+    http-request set-var(txn.client_ip) src
+    http-request set-var(txn.client_ip) req.hdr_ip(CF-Connecting-IP) if from_cloudflare { req.hdr(CF-Connecting-IP) -m found }
+    http-request del-header CF-Connecting-IP unless from_cloudflare
+    http-request set-header X-Real-IP %[var(txn.client_ip)]
+    http-request set-header X-Forwarded-For %[var(txn.client_ip)]
+    http-response set-header X-CertLocker-Origin {{ inventory_hostname }}
+    acl known_host hdr(host),field(1,:) -i {{ uncloud_ingress_settings.hostname }} {{ uncloud_ingress_settings.backoffice_hostname }} {{ uncloud_ingress_settings.grafana_hostname }}
+    acl backoffice_host hdr(host),field(1,:) -i {{ uncloud_ingress_settings.backoffice_hostname }}
+    acl grafana_host hdr(host),field(1,:) -i {{ uncloud_ingress_settings.grafana_hostname }}
+    acl monitoring_vpn src {{ uncloud_vpn_cidrs | join(' ') }}
+    acl prometheus_path path_beg /prometheus/
+    acl ready_path path -i /health/ready
+    http-request deny deny_status 404 unless known_host
+    http-request deny deny_status 403 if grafana_host !monitoring_vpn
+    http-request return status 200 content-type text/plain string ready if ready_path { nbsrv(be_ui) gt 0 } { nbsrv(be_bo) gt 0 } { nbsrv(be_gateway) gt 0 }
+    http-request return status 503 content-type text/plain string unavailable if ready_path
+    # Customer frontend, Back Office and REST share a per-client 10-second budget.
+    stick-table type string len 64 size 200k expire 10m store http_req_rate(10s)
+    http-request track-sc0 var(txn.client_ip)
+    acl too_fast sc_http_req_rate(0) gt {{ uncloud_http_rate_limit | default(400) }}
+    http-request deny deny_status 429 if too_fast
+    use_backend be_bo if backoffice_host
+    use_backend be_prometheus if grafana_host prometheus_path
+    use_backend be_grafana if grafana_host
+    use_backend be_gateway if { path_beg /gateway/ }
+    default_backend be_ui
+
+frontend local_readiness
+    bind 127.0.0.1:8404
+    http-request return status 200 content-type text/plain string ready if { nbsrv(be_ui) gt 0 } { nbsrv(be_bo) gt 0 } { nbsrv(be_gateway) gt 0 }
+    http-request return status 503 content-type text/plain string unavailable
+
+{% for backend, port, path in [('be_ui',3080,'/internal/haproxy-ready'), ('be_bo',3081,'/internal/haproxy-ready'), ('be_gateway',8300,'/gateway/rest/health')] %}
+backend {{ backend }}
+    balance roundrobin
+    http-response set-header X-CertLocker-Backend %[srv_name]
+    option httpchk
+{% if backend in ['be_ui', 'be_bo'] and uncloud_api_single_owner | default(true) | bool %}
+    http-check connect port 8510
+    http-check send meth GET uri /ready ver HTTP/1.1 hdr Host localhost
+    http-check expect status 200
+    http-check expect rstring '"success"[[:space:]]*:[[:space:]]*true'
+    http-check connect port {{ port }}
+{% endif %}
+    http-check send meth GET uri {{ path }} ver HTTP/1.1 hdr Host {{ uncloud_ingress_settings.hostname }}
+    http-check expect status 200
+    http-check expect rstring '"success"[[:space:]]*:[[:space:]]*true'
+{% for node in groups['uncloud'] %}
+    server {{ node }} {{ hostvars[node].uncloud_mesh_ip }}:{{ port }} check{{ ' backup' if node != inventory_hostname else '' }}
+{% endfor %}
+{% endfor %}
+backend be_grafana
+    option httpchk
+    http-check send meth GET uri /api/health ver HTTP/1.1 hdr Host {{ uncloud_ingress_settings.grafana_hostname }}
+    http-check expect status 200
+    server monitoring {{ hostvars[groups['uncloud'] | first].uncloud_mesh_ip }}:3001 check
+
+backend be_prometheus
+    option httpchk
+    http-check send meth GET uri /prometheus/-/ready ver HTTP/1.1 hdr Host {{ uncloud_ingress_settings.grafana_hostname }}
+    http-check expect status 200
+    server monitoring {{ hostvars[groups['uncloud'] | first].uncloud_mesh_ip }}:9090 check

@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!requirements.txt
+!collections.yml
+!tools.lock.json
+!install-tools.py

@@ -1,0 +1,331 @@
+---
+- name: Prepare the isolated Uncloud trial machines
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    docker_users: ["{{ ansible_user }}"]
+    baseline_manage_resolv_conf: false
+    package_state: present
+    java_package: temurin-25-jdk
+    use_adoptium_repo: true
+    baseline_java_version_required: 25
+    baseline_packages:
+      - ca-certificates
+      - curl
+      - wget
+      - unzip
+      - zip
+      - jq
+      - yq
+      - git
+      - vim
+      - htop
+      - fail2ban
+      - telnet
+      - net-tools
+      - dnsutils
+      - tcpdump
+      - lsof
+      - rsync
+      - gnupg
+      - software-properties-common
+      - apt-transport-https
+      - logrotate
+    fail2ban_ignore_ips: "{{ ['127.0.0.1/8', '::1'] + uncloud_operator_cidrs }}"
+    ufw_managed_enabled: true
+    ufw_managed_cleanup_high_ports_anywhere: false
+    ufw_managed_defaults:
+      - {direction: incoming, policy: deny}
+      - {direction: outgoing, policy: allow}
+    ufw_managed_rules: "{{ uncloud_ssh_rules + uncloud_mesh_rules + [{'rule': 'allow', 'src': '10.210.0.0/16', 'dest': '10.210.0.0/16', 'comment': 'Uncloud authenticated private overlay'}] }}"
+  pre_tasks:
+    - name: Prepare the operator-owned temporary directory before any privileged module
+      ansible.builtin.raw: >-
+        test "$(findmnt -n -o FSTYPE -T /run)" = tmpfs &&
+        test ! -L {{ ansible_remote_tmp | quote }} &&
+        install -d -m 0700 -o {{ ansible_user | quote }} -g root {{ ansible_remote_tmp | quote }}
+      changed_when: false
+    - name: Wait for SSH before inspecting the fresh machine
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+    - name: Gather host facts
+      ansible.builtin.setup:
+    - name: Require the dedicated Uncloud inventory and Ubuntu image
+      ansible.builtin.assert:
+        that:
+          - uncloud_deployment | default('') in ['dev', 'prod']
+          - inventory_hostname in [groups['uncloud'][0], groups['uncloud'][1]]
+          - ansible_user != 'root'
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_version == '24.04'
+          - uncloud_operator_cidrs | default([]) | length > 0
+
+    - name: Check the actual Google instance identity before changing software
+      ansible.builtin.uri:
+        url: http://metadata.google.internal/computeMetadata/v1/instance/name
+        headers:
+          Metadata-Flavor: Google
+        return_content: true
+        use_proxy: false
+      register: uncloud_gce_identity
+      check_mode: false
+      when: uncloud_provider | default('google') == 'google'
+
+    - name: Refuse a host whose identity differs from the Uncloud inventory
+      ansible.builtin.assert:
+        that:
+          - uncloud_gce_identity.content | trim == inventory_hostname
+      when: uncloud_provider | default('google') == 'google'
+
+    - name: Verify the supplied server identity through SSH facts
+      ansible.builtin.assert:
+        that:
+          - ansible_hostname == uncloud_expected_hostname
+      when: uncloud_provider | default('supplied') in ['bare-metal', 'supplied']
+
+    - name: Check existing enrollment marker
+      ansible.builtin.stat:
+        path: /etc/certlocker-uncloud
+      register: uncloud_enrollment
+
+    - name: Inspect container occupancy before enrolling a machine
+      ansible.builtin.shell: |
+        if command -v docker >/dev/null 2>&1; then docker ps -aq; fi
+      register: uncloud_existing_containers
+      changed_when: false
+      when: not uncloud_enrollment.stat.exists
+
+    - name: Refuse to enroll a machine with existing workloads
+      ansible.builtin.assert:
+        that:
+          - uncloud_enrollment.stat.exists or uncloud_existing_containers.stdout | default('') | trim == ''
+
+    - name: Wait for first boot initialization when cloud-init is installed
+      ansible.builtin.shell: |
+        if command -v cloud-init >/dev/null 2>&1; then cloud-init status --wait; fi
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Check the Ubuntu deb822 package source
+      ansible.builtin.stat:
+        path: /etc/apt/sources.list.d/ubuntu.sources
+      register: uncloud_ubuntu_sources
+
+    - name: Preserve provider DNS and use HTTPS for security updates
+      ansible.builtin.replace:
+        path: /etc/apt/sources.list.d/ubuntu.sources
+        regexp: 'http://security\.ubuntu\.com/ubuntu'
+        replace: https://security.ubuntu.com/ubuntu
+      when: uncloud_ubuntu_sources.stat.exists
+
+    - name: Bound package waits
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/90-certlocker-network
+        mode: '0644'
+        content: |
+          Acquire::http::Timeout "30";
+          Acquire::https::Timeout "30";
+          Acquire::Retries "2";
+          DPkg::Lock::Timeout "120";
+
+    - name: Restore the operator-owned Ansible tmpfs directory after every reboot
+      ansible.builtin.copy:
+        dest: "/etc/tmpfiles.d/certlocker-{{ uncloud_company }}-ansible.conf"
+        mode: '0644'
+        content: "d {{ ansible_remote_tmp }} 0700 {{ ansible_user }} root -\n"
+
+    - name: Build operator SSH firewall rules
+      ansible.builtin.set_fact:
+        uncloud_ssh_rules: "{{ (uncloud_ssh_rules | default([])) + [{'rule': 'allow', 'port': '22', 'proto': 'tcp', 'src': item, 'comment': ('certlocker updater' if item in uncloud_updater_cidrs else 'Uncloud operator SSH')}] }}"
+      loop: "{{ uncloud_operator_cidrs }}"
+
+    - name: Build peer WireGuard firewall rules
+      ansible.builtin.set_fact:
+        uncloud_mesh_rules: "{{ (uncloud_mesh_rules | default([])) + [{'rule': 'allow', 'port': '51820', 'proto': 'udp', 'src': hostvars[item].uncloud_private_ip, 'comment': 'Uncloud peer tunnel'}] }}"
+      loop: "{{ groups['uncloud'] }}"
+      when: item != inventory_hostname
+
+    - name: Install small host prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - iptables
+          - wireguard-tools
+          - python3-apt
+          - python3-cryptography
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 120
+
+  roles:
+    - baseline
+    - fail2ban_hardening
+    - ufw_managed
+    - docker
+
+  post_tasks:
+    - name: Disable swap before any application secrets are materialized
+      ansible.builtin.command: swapoff --all
+      changed_when: false
+
+    - name: Remove persistent swap entries on these dedicated application nodes
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        regexp: '^\s*[^#]\S*\s+\S+\s+swap\s+'
+        state: absent
+
+    - name: Disable core dumps from application and credential processes
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-certlocker-no-core.conf
+        content: "kernel.core_pattern=|/bin/false\nfs.suid_dumpable=0\n"
+        mode: '0644'
+
+    - name: Apply the core dump restriction
+      ansible.builtin.command: sysctl -p /etc/sysctl.d/99-certlocker-no-core.conf
+      changed_when: false
+
+    - name: Disable password and root SSH login
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-certlocker-uncloud.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          PubkeyAuthentication yes
+          MaxAuthTries 3
+          X11Forwarding no
+      register: uncloud_sshd_config
+
+    - name: Validate the complete SSH configuration
+      ansible.builtin.command: /usr/sbin/sshd -t
+      changed_when: false
+
+    - name: Reload SSH after valid configuration changes
+      ansible.builtin.service:
+        name: ssh
+        state: reloaded
+      when: uncloud_sshd_config.changed
+
+    - name: Apply Docker service handlers before verification
+      ansible.builtin.meta: flush_handlers
+
+    - name: Bound legacy Docker JSON logs while containers are recreated with capped local logging
+      ansible.builtin.copy:
+        dest: /etc/logrotate.d/certlocker-docker-json
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          /var/lib/docker/containers/*/*-json.log {
+              weekly
+              rotate 2
+              maxsize 20M
+              missingok
+              notifempty
+              compress
+              delaycompress
+              copytruncate
+          }
+
+    - name: Retain only two weeks of Cowrie honeypot log files
+      ansible.builtin.copy:
+        dest: /etc/logrotate.d/certlocker-cowrie
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          /var/lib/docker/volumes/*_cowrie_log/_data/*.log
+          /var/lib/docker/volumes/*_cowrie_log/_data/*.json
+          /var/lib/docker/volumes/*_cowrie_log/_data/tty/*.log {
+              daily
+              rotate 14
+              maxsize 100M
+              missingok
+              notifempty
+              compress
+              delaycompress
+              copytruncate
+          }
+
+    - name: Install a bounded Docker cleanup command
+      ansible.builtin.copy:
+        src: ops/files/uncloud_docker_prune.py
+        dest: /usr/local/sbin/certlocker-uncloud-docker-prune
+        owner: root
+        group: root
+        mode: '0750'
+
+    - name: Schedule weekly cleanup of stopped containers and unused Docker data
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/certlocker-docker-prune.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Remove unused CertLocker Docker data older than 14 days
+          Requires=docker.service
+          After=docker.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/python3 /usr/local/sbin/certlocker-uncloud-docker-prune
+          NoNewPrivileges=true
+          PrivateTmp=true
+          ProtectHome=true
+          ProtectSystem=full
+
+    - name: Install weekly Docker cleanup timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/certlocker-docker-prune.timer
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Weekly cleanup of unused CertLocker Docker data
+
+          [Timer]
+          OnCalendar=Sun *-*-* 03:30:00
+          RandomizedDelaySec=1h
+          Persistent=true
+          Unit=certlocker-docker-prune.service
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Enable weekly Docker cleanup timer
+      ansible.builtin.systemd:
+        name: certlocker-docker-prune.timer
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Verify Docker is usable
+      ansible.builtin.command: docker info --format '{{ '{{' }}.ServerVersion{{ '}}' }}'
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Verify Compose plugin
+      ansible.builtin.command: docker compose version
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Record bootstrap scope
+      ansible.builtin.debug:
+        msg: "Baseline, Docker, UFW, fail2ban and SSH hardening applied. Run the independent host verification before initializing Uncloud."
+
+    - name: Mark the dedicated Uncloud machine for repeatable enrollment
+      ansible.builtin.copy:
+        dest: /etc/certlocker-uncloud
+        content: "{{ inventory_hostname }}\n"
+        owner: root
+        group: root
+        mode: '0644'

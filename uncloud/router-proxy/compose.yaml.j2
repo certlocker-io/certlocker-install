@@ -1,0 +1,22 @@
+name: certlocker-{{ uncloud_company }}-router-proxy
+services:
+  router-proxy:
+    image: docker.io/library/haproxy@sha256:2caaf8b1a1ef67f3f1ea9b721f2821675d3ba4500fb518e23884fecb93e8dbaa
+    container_name: certlocker-router-proxy
+    user: '0:0'
+    network_mode: host
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    mem_limit: 128m
+    volumes:
+      - ./config:/usr/local/etc/haproxy:ro
+      - /run/certlocker/{{ uncloud_company }}/router-proxy:/run/haproxy
+    healthcheck:
+      test: [CMD-SHELL, 'wget -qO- http://127.0.0.1:19002/health/live >/dev/null']
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    logging:
+      driver: local
+      options: {max-size: '20m', max-file: '5'}

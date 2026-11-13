@@ -1,0 +1,14 @@
+[DEFAULT]
+ignoreip = {{ fail2ban_ignore_ips | join(' ') }}
+bantime = {{ fail2ban_bantime }}
+findtime = {{ fail2ban_findtime }}
+maxretry = {{ fail2ban_maxretry }}
+bantime.increment = true
+bantime.factor = 2
+bantime.maxtime = 24h
+
+[sshd]
+enabled = true
+mode = aggressive
+backend = systemd
+port = ssh

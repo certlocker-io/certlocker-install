@@ -1,0 +1,33 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    company: '{{ uncloud_company }}'
+    deployment: '{{ uncloud_deployment }}'
+    environment: 'uncloud-{{ uncloud_company }}-{{ uncloud_deployment }}'
+    stack: 'uncloud-{{ uncloud_company }}'
+    replica: '{{ inventory_hostname }}'
+alerting:
+  alert_relabel_configs:
+    - action: labeldrop
+      regex: replica
+  alertmanagers:
+    - static_configs:
+        - targets: ['127.0.0.1:9093']
+rule_files: [/etc/prometheus/rules.yml]
+scrape_configs:
+  - job_name: loki
+    static_configs:
+      - targets: ['{{ hostvars[groups['uncloud'] | first].uncloud_mesh_ip }}:3100']
+  - job_name: prometheus
+    metrics_path: /prometheus/metrics
+    static_configs:
+      - targets: ['{{ hostvars[groups['uncloud'] | first].uncloud_mesh_ip }}:9090']
+{% for job, port in [('node', 9100), ('cadvisor', 8080), ('postgres', 9187)] %}
+  - job_name: {{ job }}
+    static_configs:
+{% for node in groups['uncloud'] %}
+      - targets: ['{{ hostvars[node].uncloud_mesh_ip }}:{{ port }}']
+        labels: {node: '{{ node }}'}
+{% endfor %}
+{% endfor %}

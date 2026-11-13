@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""Install gcloud when absent, sign in, and check the selected customer project."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+# Versioned archives: https://docs.cloud.google.com/sdk/docs/downloads-versioned-archives
+# SHA-256 computed from the official GCS objects after checking their published
+# size and MD5 metadata on 2026-10-28. Latest aliases are separately repackaged.
+VERSION = '591.0.0'
+ARCHIVES = {
+    ('Linux', 'x86_64'): ('linux-x86_64', '78c570f5fcfe58a9311bd98c06b75530595e3cae6277aad75a676a39e6ee7b63'),
+    ('Linux', 'aarch64'): ('linux-arm', 'f5e5df0433f77c0e7f5df9fd4bce2e46c7b7967e79cf66e31b1164d3d4c86546'),
+    ('Darwin', 'x86_64'): ('darwin-x86_64', '89c3ca942eb609293dff5b549ec6bae5d9ec41633a132aeb8dd8087a915ab3a0'),
+    ('Darwin', 'arm64'): ('darwin-arm', '85cb726919838faff48bfba7cf676b691b0202bec7c25aabdc116649c6843242'),
+}
+VM_PERMISSIONS = ('compute.instances.create', 'compute.instances.get',
+                  'compute.instances.setMetadata', 'compute.disks.create',
+                  'compute.subnetworks.use', 'compute.subnetworks.useExternalIp')
+
+
+def archive_for(system=None, machine=None):
+    selected = (system or platform.system(), machine or platform.machine())
+    if selected not in ARCHIVES:
+        raise ValueError('Supported workstations: macOS or Linux on x86_64 or ARM64')
+    suffix, digest = ARCHIVES[selected]
+    return ('https://storage.googleapis.com/cloud-sdk-release/'
+            f'google-cloud-cli-{VERSION}-{suffix}.tar.gz', digest)
+
+
+def install_gcloud(destination):
+    url, expected = archive_for()
+    if destination.exists() or destination.is_symlink():
+        raise ValueError('Refusing to overwrite an existing Google CLI installation')
+    if not hasattr(tarfile, 'data_filter'):
+        raise ValueError('Update Python 3 to a security-patched version with tarfile.data_filter')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.gcloud-install-', dir=destination.parent) as temp:
+        archive = Path(temp) / 'sdk.tar.gz'
+        digest = hashlib.sha256()
+        size = 0
+        with urllib.request.urlopen(url, timeout=120) as response, archive.open('wb') as out:
+            while chunk := response.read(1024 * 1024):
+                size += len(chunk)
+                if size > 250 * 1024 * 1024:
+                    raise ValueError('Google CLI archive exceeds its bounded download size')
+                digest.update(chunk)
+                out.write(chunk)
+        if digest.hexdigest() != expected:
+            raise ValueError('Google CLI checksum differs from the pinned official release')
+        with tarfile.open(archive, 'r:gz') as bundle:
+            members = bundle.getmembers()
+            if any(not item.name.startswith('google-cloud-sdk/') and item.name != 'google-cloud-sdk'
+                   for item in members):
+                raise ValueError('Unexpected Google CLI archive root')
+            bundle.extractall(temp, members=members, filter='data')
+        sdk = Path(temp) / 'google-cloud-sdk'
+        subprocess.run([str(sdk / 'install.sh'), '--quiet', '--usage-reporting=false',
+                        '--path-update=false', '--command-completion=false', '--install-python=false'],
+                       check=True, env={**os.environ, 'CLOUDSDK_CONFIG': str(Path(temp) / 'config')})
+        sdk.rename(destination)
+    return destination / 'bin/gcloud'
+
+
+def gcloud_json(gcloud, *args):
+    result = subprocess.run([str(gcloud), *args, '--format=json'], capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError('Google CLI check failed: ' + ' '.join(args[:2]) + '; check login and project permissions')
+    return json.loads(result.stdout)
+
+
+LAB_PERMISSIONS = VM_PERMISSIONS + ('compute.networks.create', 'compute.subnetworks.create',
+    'compute.firewalls.create', 'compute.addresses.create', 'compute.instances.setTags', 'compute.instances.setLabels')
+
+
+def project_permissions(gcloud, project, required=VM_PERMISSIONS):
+    # The access token stays in process memory and the HTTPS Authorization header.
+    result = subprocess.run([str(gcloud), 'auth', 'print-access-token'], capture_output=True, text=True)
+    if result.returncode or not result.stdout.strip():
+        raise RuntimeError('Google login needs renewal; run gcloud auth login')
+    request = urllib.request.Request(
+        'https://cloudresourcemanager.googleapis.com/v1/projects/' + project + ':testIamPermissions',
+        data=json.dumps({'permissions': required}).encode(),
+        headers={'Authorization': 'Bearer ' + result.stdout.strip(), 'Content-Type': 'application/json'})
+    # No redirects: never forward the credential to another endpoint.
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    opener = urllib.request.build_opener(NoRedirect)
+    for attempt in range(3):
+        try:
+            with opener.open(request, timeout=30) as response:
+                granted = set(json.load(response).get('permissions', []))
+            break
+        except urllib.error.HTTPError as error:
+            status = error.code
+            error.close()
+            if status in (429, 500, 502, 503, 504) and attempt < 2:
+                print(f'Google project permissions check returned HTTP {status}; retrying.',
+                      file=sys.stderr, flush=True)
+                time.sleep(2 ** attempt)
+                continue
+            hint = {
+                401: 'Renew Google login with gcloud auth login, then retry.',
+                403: 'Check the active Google account, project access and Cloud Resource Manager API availability.',
+                404: 'Check the project ID and whether the active Google account can access it.',
+                429: 'Google rate limited the request; retry shortly.',
+            }.get(status, 'Retry shortly; if it persists, check Google API availability and your network.')
+            # Do not echo response bodies or headers: they may contain credentials
+            # or private details from Google or an intervening network proxy.
+            raise RuntimeError(f'Google project permissions check (testIamPermissions) '
+                               f'failed for {project}: HTTP {status}. {hint}') from None
+    missing = sorted(set(required) - granted)
+    if missing:
+        raise ValueError('Google account lacks required project permissions: ' + ', '.join(missing))
+    return sorted(granted)
+
+
+def choose_project(gcloud, project=None, interactive=False):
+    if project:
+        return project
+    if not interactive:
+        raise ValueError('Supply --project for unattended setup; the default Google project is not changed')
+    projects = gcloud_json(gcloud, 'projects', 'list', '--filter=lifecycleState:ACTIVE')
+    projects = sorted((item for item in projects if item.get('projectId')), key=lambda item: item['projectId'])
+    if not projects:
+        raise ValueError('No accessible active Google projects were found; ask the project owner for access')
+    print('Choose the Google project for these servers:')
+    for number, item in enumerate(projects, 1):
+        print(f"  {number}. {item['projectId']} — {item.get('name', item['projectId'])}")
+    choices = {item['projectId'] for item in projects}
+    while True:
+        selected = input('Project number or project ID: ').strip()
+        if selected.isdigit() and 1 <= int(selected) <= len(projects):
+            return projects[int(selected) - 1]['projectId']
+        if selected in choices:
+            return selected
+        print('Choose one of the listed projects; no project has been selected yet.')
+
+
+def choose_zones(gcloud, project, first=None, second=None, interactive=False):
+    if not interactive and (not first or not second):
+        raise ValueError('Supply --zone-1 and --zone-2 for unattended provisioning preflight')
+    zones = gcloud_json(gcloud, 'compute', 'zones', 'list', '--project', project, '--filter=status:UP')
+    available = sorted(item['name'] for item in zones if item.get('status') == 'UP' and item.get('name'))
+    if not available:
+        raise ValueError('No available Google zones; check Compute API access in the selected project')
+    print('Available Google zones in this project: ' + ', '.join(available))
+    print('Examples: europe-west1-b = St. Ghislain, Belgium; '
+          'europe-west4-a = Eemshaven, Netherlands; '
+          'us-central1-a = Council Bluffs, Iowa, USA.')
+    print('Each zone name ends in a failure-domain letter. Full locations: '
+          'https://docs.cloud.google.com/compute/docs/regions-zones')
+    selected = []
+    for index, value in enumerate((first, second), 1):
+        if not value and interactive:
+            while True:
+                value = input('Zone for Ubuntu server ' + str(index) + ': ').strip()
+                if value in available and value not in selected:
+                    break
+                print('Choose an available zone different from the other server.')
+        if value not in available or value in selected:
+            raise ValueError('Both VM zones must be available and distinct')
+        selected.append(value)
+    return selected
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--project')
+    parser.add_argument('--zone-1', help='Google zone for the first Ubuntu server')
+    parser.add_argument('--zone-2', help='Different Google zone for the second Ubuntu server')
+    parser.add_argument('--machine-type-1', help='VM type for server 1 (default e2-standard-2)')
+    parser.add_argument('--machine-type-2', help='VM type for server 2 (default e2-standard-2)')
+    parser.add_argument('--machine-type', help='Set the same VM type for both servers')
+    parser.add_argument('--non-interactive', action='store_true')
+    parser.add_argument('--provision-lab', action='store_true', help='Also require network, subnet, firewall, address and VM label/tag creation permissions')
+    parser.add_argument('--check-only', action='store_true', help='Never install software or start login')
+    args = parser.parse_args(argv)
+    if not (3, 10) <= sys.version_info[:2] <= (3, 15):
+        raise ValueError('Python 3.10–3.15 is required for this Google CLI release')
+    archive_for()
+    root = Path.home() / '.local/share/certlocker/tools' / ('google-cloud-sdk-' + VERSION)
+    gcloud = shutil.which('gcloud')
+    if not gcloud and (root / 'bin/gcloud').is_file():
+        gcloud = root / 'bin/gcloud'
+    if not gcloud:
+        if args.check_only:
+            raise ValueError('Google CLI is missing; rerun without --check-only to install it')
+        print('Installing the checksum-verified Google CLI in your user directory.', flush=True)
+        gcloud = install_gcloud(root)
+    active = gcloud_json(gcloud, 'auth', 'list', '--filter=status:ACTIVE')
+    if not active:
+        if args.check_only or args.non_interactive or not sys.stdin.isatty():
+            raise ValueError('Google login is required; run ' + str(gcloud) + ' auth login')
+        subprocess.run([str(gcloud), 'auth', 'login'], check=True)
+        active = gcloud_json(gcloud, 'auth', 'list', '--filter=status:ACTIVE')
+        if len(active) != 1:
+            raise ValueError('Select one active Google account before provisioning')
+    project = choose_project(gcloud, args.project, sys.stdin.isatty() and not args.non_interactive)
+    if not project or not re.fullmatch(r'[a-z][a-z0-9-]{4,28}[a-z0-9]', project):
+        raise ValueError('Supply a valid --project ID; the default Google project is not changed')
+    info = gcloud_json(gcloud, 'projects', 'describe', project)
+    if info.get('lifecycleState') != 'ACTIVE':
+        raise ValueError('The selected Google project is not active')
+    billing = gcloud_json(gcloud, 'billing', 'projects', 'describe', project)
+    if not billing.get('billingEnabled'):
+        raise ValueError('Enable billing for the selected Google project')
+    permissions = project_permissions(gcloud, project, LAB_PERMISSIONS if args.provision_lab else VM_PERMISSIONS)
+    zones = choose_zones(gcloud, project, args.zone_1, args.zone_2,
+                         sys.stdin.isatty() and not args.non_interactive and not args.check_only)
+    machine_types = [args.machine_type_1 or args.machine_type or 'e2-standard-2',
+                     args.machine_type_2 or args.machine_type or 'e2-standard-2']
+    if any(not re.fullmatch(r'[a-z][a-z0-9-]+', item) for item in machine_types):
+        raise ValueError('Invalid Google machine type')
+    for zone, machine_type in zip(zones, machine_types):
+        machine = gcloud_json(gcloud, 'compute', 'machine-types', 'describe', machine_type,
+                              '--project', project, '--zone', zone)
+        if machine.get('guestCpus', 0) < 2 or machine.get('memoryMb', 0) < 8192:
+            raise ValueError(f'{machine_type} in {zone} is below the minimum 2 vCPUs and 8 GiB RAM')
+    result = {'project': project, 'gcloud': str(gcloud), 'billing_enabled': True,
+              'zones': zones, 'machine_types': machine_types,
+              'infrastructure_provisioned': False,
+              'vm_project_permissions': permissions,
+              'remaining_checks': ['VM service-account actAs', 'network/firewall provisioning',
+                                   'Artifact Registry and KMS access', 'regional quota']}
+    print(json.dumps(result, indent=2))
+    return result
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, RuntimeError) as error:
+        raise SystemExit(str(error))
+    except Exception as error:
+        raise SystemExit('Workstation preparation stopped: ' + type(error).__name__) from None

@@ -1,0 +1,12 @@
+#!/bin/bash
+set -euo pipefail
+# Docker can start before the Uncloud bridge address is restored after a reboot.
+for attempt in $(seq 1 60); do
+  if ip -4 -o address show | grep -Fq ' {{ uncloud_mesh_ip }}/'; then
+    cd /opt/certlocker/uncloud-db
+    exec /usr/bin/docker compose up -d --wait --wait-timeout 300
+  fi
+  sleep 2
+done
+echo 'Uncloud private address did not become available; refusing to bind elsewhere.' >&2
+exit 1

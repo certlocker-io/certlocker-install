@@ -1,0 +1,194 @@
+---
+- name: Load only missing company certificate assets through the released Java data loader
+  hosts: "{{ groups['uncloud'][0] }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    loader_root: "/run/certlocker/{{ uncloud_company }}/certificate-loader"
+    allowed_tables: [accounts, users, registrations, private_secrets, secrets, hosts, tokens, acme_automations, acme_clients, dns_clients, certs, acme_workflow, acme_automation_queue]
+  tasks:
+    - name: Require an explicit bounded dataset
+      ansible.builtin.assert:
+        that:
+          - uncloud_certificate_seed is mapping
+          - uncloud_certificate_seed | length > 0
+          - uncloud_certificate_seed.keys() | list | difference(allowed_tables) | length == 0
+          - "not ('acme_workflow' in uncloud_certificate_seed or 'acme_automation_queue' in uncloud_certificate_seed) or uncloud_certificate_seed | length == 1"
+        fail_msg: Load prerequisite assets first, then submit a workflow or automation queue in its own verified load.
+      no_log: true
+
+    - name: Require safe immutable loader identities
+      ansible.builtin.assert:
+        that:
+          - item.value | length > 0
+          - item.value | map(attribute='id') | select('match', '^[A-Za-z0-9_.-]{1,128}$') | list | length == item.value | length
+      loop: "{{ uncloud_certificate_seed | dict2items }}"
+      no_log: true
+
+    - name: Remove a previous interrupted loader's transient files
+      ansible.builtin.file:
+        path: "{{ loader_root }}"
+        state: absent
+      no_log: true
+
+    - name: Create private memory-backed loader directories
+      ansible.builtin.file:
+        path: "{{ loader_root }}"
+        state: directory
+        mode: '0700'
+
+    - name: Require memory-backed loader input
+      ansible.builtin.command: "findmnt -n -o FSTYPE -T {{ loader_root }}"
+      register: loader_filesystem
+      changed_when: false
+      failed_when: loader_filesystem.stdout | trim != 'tmpfs'
+
+    - name: Refuse leftover loader input in persistent container storage
+      ansible.builtin.command:
+        argv: [docker, diff, certlocker-dataservice]
+      register: loader_layer_before
+      changed_when: false
+      failed_when: loader_layer_before.rc != 0 or '/dev/shm/certlocker-ha-seed' in loader_layer_before.stdout
+      no_log: true
+
+    - name: Import the additive dataset and remove transient plaintext
+      block:
+        - name: Render only the requested tables into tmpfs
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - |
+                import json, os, pathlib, re, sys
+                root = pathlib.Path(sys.argv[1])
+                tables = json.load(sys.stdin)
+                for table, rows in tables.items():
+                    if not re.fullmatch('[a-z_]+', table):
+                        raise SystemExit('Invalid loader table name')
+                    fd = os.open(root / (table + '.json'), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+                    with os.fdopen(fd, 'w') as stream:
+                        json.dump(rows, stream)
+              - "{{ loader_root }}"
+            stdin: "{{ uncloud_certificate_seed | to_json }}"
+          no_log: true
+
+        - name: Remove a previous interrupted container inbox
+          ansible.builtin.command:
+            argv: [docker, exec, certlocker-dataservice, rm, -rf, /dev/shm/certlocker-ha-seed]
+          no_log: true
+
+        - name: Create the container loader inbox on tmpfs
+          ansible.builtin.command:
+            argv: [docker, exec, certlocker-dataservice, mkdir, -m, '0700', -p, /dev/shm/certlocker-ha-seed]
+
+        - name: Transfer the private fixture files without persistent container storage
+          ansible.builtin.shell: |
+            set -o pipefail
+            tar -C {{ loader_root | quote }} -cf - . | \
+              docker exec -i certlocker-dataservice tar -C /dev/shm/certlocker-ha-seed -xf -
+          args:
+            executable: /bin/bash
+          no_log: true
+
+        - name: Verify fixtures reached the running container's memory filesystem
+          ansible.builtin.command:
+            argv: [docker, exec, certlocker-dataservice, test, -s, "/dev/shm/certlocker-ha-seed/{{ item }}.json"]
+          loop: "{{ uncloud_certificate_seed.keys() | list }}"
+          changed_when: false
+
+        - name: Verify loader input has not entered the persistent container layer
+          ansible.builtin.command:
+            argv: [docker, diff, certlocker-dataservice]
+          register: loader_layer_after
+          changed_when: false
+          failed_when: loader_layer_after.rc != 0 or '/dev/shm/certlocker-ha-seed' in loader_layer_after.stdout
+          no_log: true
+
+        - name: Invoke the released append-only loader with the installed master key
+          ansible.builtin.shell: |
+            docker exec certlocker-dataservice bash -ec '
+              export POSTGRES_PASSWORD="$(cat /run/secrets/postgres)"
+              exec java -Xmx256m -DApplicationConfig=application.json \
+                -DApplicationLogs=/dev/shm/certlocker-ha-seed/logs \
+                -DLauncherLogs=/dev/shm/certlocker-ha-seed/logs \
+                -cp "/app/config:/app/lib/*:/app/undertow/dataservice/WEB-INF/classes" \
+                certlocker.dao.application.DAOMigrate \
+                -instance main -schema jeremy -load /dev/shm/certlocker-ha-seed -append'
+          register: loader_execution
+          no_log: true
+
+        - name: Validate a requested existing company user promotion
+          ansible.builtin.assert:
+            that:
+              - uncloud_account_user_update is mapping
+              - uncloud_account_user_update.id is match('^[A-Za-z0-9_.-]{1,128}$')
+              - uncloud_account_user_update.email is match('^[^\s@]+@[^\s@]+\.[^\s@]+$')
+              - uncloud_account_user_update.display_name | length > 0
+              - uncloud_account_user_update.password is match('^\$argon2id\$')
+            fail_msg: Existing company user promotion data is invalid.
+          when: uncloud_account_user_update is defined
+          no_log: true
+
+        - name: Promote the existing company user to superuser and set the bootstrap password
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - -i
+              - certlocker-uncloud-postgres
+              - bash
+              - -ec
+              - 'export PGPASSWORD="$(cat /run/lab-secrets/postgres)" PGSSLMODE=require; exec psql -h 127.0.0.1 -U postgres -d certlocker -Atq -v ON_ERROR_STOP=1'
+            stdin: >-
+              UPDATE jeremy.users
+              SET password='{{ uncloud_account_user_update.password | replace("'", "''") }}',
+                  displayname='{{ uncloud_account_user_update.display_name | replace("'", "''") }}',
+                  status='ACTIVE', emailverified=true, tfaauth='NONE',
+                  roleids=CASE WHEN 'SUPER_USER_FE'=ANY(roleids) THEN roleids
+                                ELSE array_append(roleids,'SUPER_USER_FE') END,
+                  dateupdated=now()
+              WHERE id='{{ uncloud_account_user_update.id }}'
+                AND lower(email)=lower('{{ uncloud_account_user_update.email | replace("'", "''") }}')
+              RETURNING id;
+          register: promoted_user
+          failed_when: promoted_user.stdout | trim != uncloud_account_user_update.id
+          when: uncloud_account_user_update is defined
+          no_log: true
+
+        - name: Report only loader row counts and exception class names
+          ansible.builtin.debug:
+            msg:
+              rows: "{{ loader_execution.stdout | regex_findall('Loaded [0-9]+ rows for table [a-z_]+') }}"
+              exceptions: "{{ (loader_execution.stdout ~ loader_execution.stderr) | regex_findall('(?:[a-z][a-z0-9_]*\\.)+[A-Z][A-Za-z0-9]*(?:Exception|Error)') | unique | list }}"
+
+        - name: Verify every inserted or preserved identity independently of loader exit status
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - -i
+              - certlocker-uncloud-postgres
+              - bash
+              - -ec
+              - 'export PGPASSWORD="$(cat /run/lab-secrets/postgres)" PGSSLMODE=require; exec psql -h 127.0.0.1 -U postgres -d certlocker -Atq -v ON_ERROR_STOP=1'
+            stdin: "SELECT count(*) FROM jeremy.{{ item.key }} WHERE id IN ('{{ item.value | map(attribute='id') | join(\"','\") }}');"
+          loop: "{{ uncloud_certificate_seed | dict2items }}"
+          register: loader_verification
+          changed_when: false
+          failed_when: loader_verification.stdout | trim | int != item.value | length
+          until: loader_verification.stdout | trim | int == item.value | length
+          retries: 10
+          delay: 1
+          no_log: true
+      always:
+        - name: Remove the container's transient fixture files and loader logs
+          ansible.builtin.command:
+            argv: [docker, exec, certlocker-dataservice, rm, -rf, /dev/shm/certlocker-ha-seed]
+          no_log: true
+
+        - name: Remove the host's transient fixture files
+          ansible.builtin.file:
+            path: "{{ loader_root }}"
+            state: absent
+          no_log: true

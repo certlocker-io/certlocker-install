@@ -1,0 +1,1315 @@
+#!/usr/bin/env python3
+"""Provision and install a customer CertLocker HA environment on Google Cloud.
+
+Run up without a config file for Google sign-in and the guided setup questions.
+The wizard saves company settings, then creates the servers and installs the stack.
+Saved profiles support status checks, resume, removal and unattended setup.
+Each interactive up creates a new named company installation.
+Uncloud supplies the private container mesh under the HA stack.
+"""
+import argparse
+from contextlib import ExitStack
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import uuid
+import urllib.request
+from uncloud_support import company_slug, require_deployment, environment_config_path
+from uncloud_terminal import can_prompt, prompt_line, prompt_secret
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from uncloud_progress import Progress
+
+ROOT = Path(__file__).resolve().parents[1]
+TERRAFORM = ROOT / "terraform/gcp-uncloud"
+STATE = Path.home() / ".local/share/certlocker/cl-deployment"
+LEGACY_STATE = Path.home() / ".local/share/certlocker/cl-deployment-lab"
+from uncloud_nodes import node_names
+from uncloud_access import with_updater
+NAMES = node_names("certlocker")
+ZONES = dict(zip(NAMES, ("europe-west1-b", "europe-west4-a")))
+REGIONS = {name: zone.rsplit('-', 1)[0] for name, zone in ZONES.items()}
+CIDRS = dict(zip(NAMES, ("10.44.10.0/24", "10.44.20.0/24")))
+RESOURCE_NAMES = {
+    'google_compute_network.lab': 'certlocker-uncloud',
+    'google_compute_firewall.operator': 'certlocker-uncloud-operator',
+    'google_compute_firewall.mesh': 'certlocker-uncloud-mesh',
+    'google_compute_firewall.origins': 'certlocker-uncloud-origins',
+    **{f'google_compute_{kind}.{label}["{node}"]':
+       (node if kind == 'instance' else f'certlocker-uncloud-{node}')
+       for node in NAMES for kind, label in
+       [('subnetwork', 'lab'), ('address', 'node'), ('instance', 'node')]},
+}
+
+
+COMPANY = 'example'
+TRUST_GROUP = 'example'
+NETWORK_NAME = 'certlocker-uncloud'
+MACHINE_NAMES = dict(zip(NAMES, NAMES))
+RESOURCE_SUFFIXES = dict(zip(NAMES, NAMES))
+DNS_ZONE = 'certlocker.io'
+LAB_NAMES = ('certlocker.example.com', 'backoffice.example.com')
+
+def require_new_company(company, reject_profile=False):
+    company = company_slug(company)
+    profile = environment_config_path(ROOT, company)
+    company_state = Path.home()/'.local/share/certlocker/cl-deployment'/company
+    legacy_company_state = LEGACY_STATE/company
+    inventory_marker = ROOT/'inventory/uncloud'/company/'.setup.json'
+    if ((reject_profile and profile.exists()) or (company_state/'active.json').exists()
+            or (legacy_company_state/'active.json').exists() or inventory_marker.exists()):
+        raise ValueError('That company already has installation records. Choose a new company name; existing installations are preserved.')
+    for state_file in (company_state/'terraform'/'terraform.tfstate',
+                       legacy_company_state/'terraform'/'terraform.tfstate'):
+        if state_file.exists() and json.loads(state_file.read_text()).get('resources'):
+            raise ValueError('That company already has Terraform resources. Choose a new company name.')
+
+
+def configure(config):
+    global NAMES, CIDRS, COMPANY, TRUST_GROUP, NETWORK_NAME, MACHINE_NAMES, RESOURCE_SUFFIXES, ZONES, REGIONS, RESOURCE_NAMES, DNS_ZONE, LAB_NAMES, STATE, TERRAFORM
+    COMPANY = config.get('company', 'example')
+    from uncloud_support import company_slug
+    COMPANY = company_slug(COMPANY)
+    NAMES = node_names(COMPANY, config.get("nodes"))
+    CIDRS = dict(zip(NAMES, ("10.44.10.0/24", "10.44.20.0/24")))
+    TRUST_GROUP = config.get('trust_group', COMPANY)
+    if len(COMPANY)>40:
+        raise ValueError('Company slug must be at most 40 characters for Google resource names')
+    NETWORK_NAME = 'certlocker-' + COMPANY
+    MACHINE_NAMES = dict(zip(NAMES, (COMPANY+'-a', COMPANY+'-b')))
+    # Preserve the identities of installations created by the original lab harness.
+    if config.get('legacy_resource_names'):
+        MACHINE_NAMES = dict(zip(NAMES, NAMES))
+    RESOURCE_SUFFIXES = dict(zip(NAMES, NAMES if config.get('legacy_resource_names') else ('a','b')))
+    ZONES = {node:config['nodes'][node]['zone'] for node in NAMES}
+    REGIONS = {node:zone.rsplit('-',1)[0] for node,zone in ZONES.items()}
+    RESOURCE_NAMES = {'google_compute_network.lab':NETWORK_NAME,
+        **{'google_compute_firewall.'+key:NETWORK_NAME+'-'+key for key in ('operator','mesh','origins')},
+        **{f'google_compute_{kind}.{label}["{node}"]':
+           MACHINE_NAMES[node] if kind=='instance' else NETWORK_NAME+'-'+RESOURCE_SUFFIXES[node]
+           for node in NAMES for kind,label in [('subnetwork','lab'),('address','node'),('instance','node')]}}
+    DNS_ZONE = config.get('dns_zone','certlocker.io')
+    LAB_NAMES = tuple(config.get(key,default).removeprefix('https://').rstrip('/') for key,default in
+        (('front_url','https://certlocker.example.com'),('backoffice_url','https://backoffice.example.com')))
+    require_deployment(config)
+    STATE = Path.home()/'.local/share/certlocker/cl-deployment'/COMPANY
+    legacy_company_state = LEGACY_STATE/COMPANY
+    if not (STATE/'terraform').exists() and (legacy_company_state/'terraform').exists():
+        STATE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.move(str(legacy_company_state), str(STATE))
+    TERRAFORM = STATE/'terraform'
+    TERRAFORM.mkdir(parents=True,exist_ok=True)
+    legacy_state = ROOT/'terraform/gcp-uncloud/terraform.tfstate'
+    if config.get('legacy_resource_names') and legacy_state.exists() and not (TERRAFORM/'terraform.tfstate').exists():
+        shutil.copy2(legacy_state,TERRAFORM/'terraform.tfstate')
+    for source in (ROOT/'terraform/gcp-uncloud').glob('*.tf'):
+        shutil.copy2(source,TERRAFORM/source.name)
+    shutil.copy2(ROOT/'terraform/gcp-uncloud/.terraform.lock.hcl',TERRAFORM/'.terraform.lock.hcl')
+    import uncloud_dns
+    uncloud_dns.LAB_NAMES = LAB_NAMES
+    uncloud_dns.LAB_COMPANY = COMPANY
+    uncloud_dns.LAB_NODES = NAMES
+
+
+def use_company_names_after_destroy(workflow):
+    """Only an empty, independently verified lab may change Terraform identities."""
+    old_names = node_names(COMPANY, workflow.config['nodes'])
+    new_names = node_names(COMPANY)
+    if old_names == new_names and not workflow.config.get('legacy_resource_names'):
+        return
+    if workflow.command(['terraform', '-chdir=' + str(TERRAFORM), 'state', 'list'], capture=True).strip():
+        raise ValueError('Cannot rename nodes while Terraform still owns resources')
+    workflow.config['nodes'] = dict(zip(new_names, (workflow.config['nodes'][n] for n in old_names)))
+    workflow.config.pop('legacy_resource_names', None)
+    private_json(workflow.config_path, workflow.config)
+    configure(workflow.config)
+    # Rebuild the variable file and revalidate with the new node keys. No saved
+    # state addresses are rewritten while resources exist.
+    workflow.prepare()
+
+
+def timestamp():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def operator_cidr(value):
+    if value == 'auto':
+        with urllib.request.urlopen('https://api.ipify.org', timeout=15) as response:
+            address = ipaddress.IPv4Address(response.read(64).decode().strip())
+        if not address.is_global:
+            raise ValueError('Operator discovery did not return a public IPv4 address')
+        return str(address) + '/32'
+    network = ipaddress.ip_network(value)
+    if network.version != 4 or network.prefixlen != 32:
+        raise ValueError('Operator access must be one IPv4 /32')
+    return str(network)
+
+
+def private_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.write_text(json.dumps(value, indent=2) + '\n')
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def _latest_run_result():
+    runs = STATE / 'runs'
+    if not runs.exists():
+        return None, None
+    results = sorted(runs.glob('*/result.json'), key=lambda path: path.stat().st_mtime)
+    if not results:
+        return None, None
+    path = results[-1]
+    try:
+        return path, json.loads(path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return path, None
+
+
+def _company_state_present(company):
+    """True when controller state suggests this company already has an install in flight or complete."""
+    state = Path.home() / '.local/share/certlocker/cl-deployment' / company
+    if (state / 'active.json').exists():
+        return True
+    if (state / 'installations').exists() and any((state / 'installations').glob('*/timings-setup.json')):
+        return True
+    if (state / 'terraform' / 'terraform.tfstate').exists():
+        return True
+    inventory = ROOT / 'inventory' / 'uncloud' / company
+    return (inventory / '.setup.json').exists()
+
+
+def resolve_company_config(explicit=None):
+    """Resolve uncloud/environments/COMPANY.json when --config is omitted.
+
+    Prefers an unambiguous single environment file, otherwise the single company
+    with present controller/inventory state. Ambiguous cases stay explicit.
+    """
+    if explicit is not None:
+        return Path(explicit)
+    env_dir = ROOT / 'uncloud' / 'environments'
+    files = sorted(env_dir.glob('*.json')) if env_dir.exists() else []
+    if not files:
+        return None
+    if len(files) == 1:
+        return files[0]
+    stateful = [path for path in files if _company_state_present(path.stem)]
+    if len(stateful) == 1:
+        return stateful[0]
+    return None
+
+
+def discover_local_companies():
+    """Company slugs that still have a local environment file, controller state or inventory."""
+    found = set()
+    env_dir = ROOT / 'uncloud' / 'environments'
+    if env_dir.exists():
+        found.update(path.stem for path in env_dir.glob('*.json'))
+    for base in (Path.home() / '.local/share/certlocker/cl-deployment', LEGACY_STATE):
+        if not base.exists():
+            continue
+        for path in base.iterdir():
+            if path.is_dir() and not path.name.startswith('.'):
+                found.add(path.name)
+    inventory_root = ROOT / 'inventory' / 'uncloud'
+    if inventory_root.exists():
+        found.update(path.name for path in inventory_root.iterdir() if path.is_dir())
+    companies = []
+    for name in sorted(found):
+        try:
+            companies.append(company_slug(name))
+        except ValueError:
+            continue
+    return companies
+
+
+def company_has_terraform_resources(company):
+    company = company_slug(company)
+    for state_file in (
+            Path.home() / '.local/share/certlocker/cl-deployment' / company / 'terraform' / 'terraform.tfstate',
+            LEGACY_STATE / company / 'terraform' / 'terraform.tfstate'):
+        if not state_file.exists():
+            continue
+        try:
+            if json.loads(state_file.read_text()).get('resources'):
+                return True
+        except (OSError, ValueError, json.JSONDecodeError):
+            return True
+    return False
+
+
+def clean_local_company(company, *, force=False, remove_ssh=True):
+    """Remove local environment JSON, controller state, inventory and optional SSH key.
+
+    Does not destroy Google Cloud resources, Cloudflare DNS or Trust secrets.
+    """
+    company = company_slug(company)
+    if company_has_terraform_resources(company) and not force:
+        raise ValueError(
+            f'{company} still has Terraform resources in local state. '
+            f'Run ./uncloudctl destroy --config uncloud/environments/{company}.json '
+            '--remove-dns --remove-trust first, or pass --force to delete local files only '
+            '(cloud resources would be orphaned).'
+        )
+    removed = []
+    for path in (
+            environment_config_path(ROOT, company),
+            ROOT / 'uncloud' / 'lab' / f'{company}.lab.json',
+            ROOT / 'uncloud' / 'lab' / f'{company}.json',
+            Path.home() / '.local/share/certlocker/cl-deployment' / company,
+            LEGACY_STATE / company,
+            ROOT / 'inventory' / 'uncloud' / company,
+    ):
+        if not path.exists():
+            continue
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        removed.append(str(path))
+    if remove_ssh:
+        key = Path.home() / '.ssh' / f'certlocker-{company}'
+        for path in (key, Path(str(key) + '.pub')):
+            if path.exists():
+                path.unlink()
+                removed.append(str(path))
+    return removed
+
+
+def run_clean(args):
+    """Wipe local company configs so interactive up can start fresh."""
+    if args.remove_dns or args.remove_trust:
+        raise ValueError('clean only removes local files; use destroy --remove-dns/--remove-trust for cloud cleanup')
+    if args.config is not None and getattr(args, 'all_companies', False):
+        raise ValueError('Use either --config COMPANY.json or --all, not both')
+    if args.config is not None:
+        selected = json.loads(Path(args.config).read_text())
+        companies = [company_slug(selected.get('company') or Path(args.config).stem)]
+    elif getattr(args, 'all_companies', False):
+        companies = discover_local_companies()
+    else:
+        companies = discover_local_companies()
+        if len(companies) > 1:
+            raise ValueError(
+                'Multiple local company leftovers found (' + ', '.join(companies) + '). '
+                'Pass --all to clean every local config, or --config uncloud/environments/COMPANY.json.'
+            )
+    if not companies:
+        print('No local company environment files, controller state or inventory to clean.', flush=True)
+        return
+    force = bool(getattr(args, 'force', False))
+    confirm = bool(getattr(args, 'yes', False))
+    if not confirm:
+        if not can_prompt(args.non_interactive):
+            raise ValueError('Pass --yes to clean local configs without a confirmation prompt')
+        listed = ', '.join(companies)
+        answer = prompt_line(
+            f'Remove local configs/state for {listed}? This does not destroy cloud VMs [yes/N]'
+        ).strip().lower()
+        if answer not in ('yes', 'y'):
+            print('Clean cancelled; local files left unchanged.', flush=True)
+            return
+    for company in companies:
+        removed = clean_local_company(company, force=force)
+        if removed:
+            print(f'Cleaned local leftovers for {company} ({len(removed)} path(s)).', flush=True)
+        else:
+            print(f'No local leftovers found for {company}.', flush=True)
+    print(
+        'Local clean finished. This does not revoke company Trust '
+        '(certificate/SMTP enrollment can still block a fresh up with different settings). '
+        'If Trust leftovers remain: CERTLOCKER_TOKEN=… ./uncloudctl destroy '
+        '--config uncloud/environments/COMPANY.json --remove-trust --non-interactive. '
+        'Then run ./uncloudctl up in a terminal for a fresh install.',
+        flush=True,
+    )
+
+
+def _latest_setup_timings():
+    installations = STATE / 'installations'
+    if not installations.exists():
+        return None, []
+    candidates = sorted(installations.glob('*/timings-setup.json'), key=lambda path: path.stat().st_mtime)
+    if not candidates:
+        return None, []
+    path = candidates[-1]
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return path, []
+    return path, list(document.get('playbooks') or [])
+
+
+def _terraform_has_resources(*, strict=False):
+    state_file = TERRAFORM / 'terraform.tfstate'
+    if not state_file.exists():
+        return False
+    try:
+        document = json.loads(state_file.read_text())
+        if not isinstance(document, dict) or not isinstance(document.get('resources', []), list):
+            raise ValueError('Invalid Terraform state')
+        if any(not isinstance(row, dict) or row.get('mode') not in ('managed', 'data')
+               for row in document.get('resources', [])):
+            raise ValueError('Invalid Terraform resource entries')
+    except (OSError, ValueError):
+        if strict:
+            raise ValueError('Cannot verify Terraform state; refusing to replace the provisioning identity') from None
+        return False
+    resources = document.get('resources') or []
+    return any(row.get('mode') == 'managed' for row in resources)
+
+
+def check_company_status(config_path):
+    """Read-only status for a paused or complete company install; never mutates state."""
+    from uncloud_support import inventory_directory
+    from uncloud_progress import format_duration
+
+    config_rel = str(Path(config_path))
+    try:
+        config_rel = str(Path(config_path).resolve().relative_to(ROOT))
+    except ValueError:
+        pass
+    inventory = inventory_directory(COMPANY)
+    active_path = STATE / 'active.json'
+    active = None
+    if active_path.exists():
+        try:
+            active = json.loads(active_path.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            active = {'invalid': True}
+    run_path, run = _latest_run_result()
+    timing_path, stages = _latest_setup_timings()
+    failed_stages = [row for row in stages if row.get('status') == 'failed']
+    last_stage = stages[-1] if stages else None
+    infra = _terraform_has_resources()
+    setup_marker = inventory / '.setup.json'
+    has_inventory = setup_marker.exists() and (inventory / 'hosts.json').exists()
+    lock_held = False
+    lock_path = STATE / 'workflow.lock'
+    if lock_path.exists():
+        with lock_path.open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            except BlockingIOError:
+                lock_held = True
+
+    if active and not active.get('invalid'):
+        phase = 'complete'
+        summary = 'Installation is marked complete (active.json present).'
+        nxt = (
+            f'./uncloudctl destroy --config {config_rel} --remove-dns --remove-trust\n'
+            '  # Contact CertLocker for later application releases.'
+        )
+    elif infra or has_inventory or stages:
+        phase = 'paused'
+        if failed_stages:
+            failed = failed_stages[-1]
+            label = failed.get('stage') or failed.get('playbook') or 'unknown stage'
+            summary = f'Setup paused after failure at {label}.'
+        elif last_stage and last_stage.get('status') == 'passed':
+            label = last_stage.get('stage') or last_stage.get('playbook') or 'last stage'
+            summary = f'Setup incomplete; last recorded stage passed: {label}.'
+        elif run and run.get('status') in ('failed', 'running'):
+            summary = f'Last workflow run status is {run.get("status")} without an active installation marker.'
+        else:
+            summary = 'Infrastructure or inventory exists, but setup has not finished.'
+        nxt = f'./uncloudctl resume --config {config_rel}'
+    else:
+        phase = 'empty'
+        summary = 'No active installation or Terraform resources found for this company.'
+        nxt = f'./uncloudctl up --config {config_rel}'
+
+    try:
+        deployment = require_deployment(json.loads(Path(config_path).read_text()))
+    except (OSError, ValueError, json.JSONDecodeError, KeyError):
+        deployment = None
+    report = {
+        'company': COMPANY,
+        'deployment': deployment,
+        'phase': phase,
+        'summary': summary,
+        'config': config_rel,
+        'state_dir': str(STATE),
+        'workflow_lock_held': lock_held,
+        'infrastructure_present': infra,
+        'inventory_present': has_inventory,
+        'active_marker': bool(active and not active.get('invalid')),
+        'active': active,
+        'last_run': None if not run_path else {
+            'path': str(run_path),
+            'status': None if not run else run.get('status'),
+            'started_at': None if not run else run.get('started_at'),
+            'finished_at': None if not run else run.get('finished_at'),
+            'total_seconds': None if not run else run.get('total_seconds'),
+        },
+        'last_setup_stage': last_stage,
+        'failed_setup_stages': failed_stages[-3:],
+        'next_command': nxt.split('\n')[0].strip(),
+        'next': nxt,
+    }
+
+    print(f'Company: {COMPANY} ({report["deployment"] or "deployment unknown"})', flush=True)
+    print(f'Phase: {phase}', flush=True)
+    print(summary, flush=True)
+    print(f'State: {STATE}', flush=True)
+    print(f'Infrastructure: {"present" if infra else "absent"}', flush=True)
+    print(f'Inventory: {"present" if has_inventory else "absent"}', flush=True)
+    print(f'Active marker: {"yes" if report["active_marker"] else "no"}', flush=True)
+    if lock_held:
+        print('Workflow lock: held (another uncloudctl run is in progress)', flush=True)
+    if run_path:
+        status = report['last_run']['status'] or 'unknown'
+        total = report['last_run']['total_seconds']
+        timing = f', {format_duration(total)}' if isinstance(total, (int, float)) else ''
+        print(f'Last run: {status}{timing} ({run_path})', flush=True)
+    if last_stage:
+        label = last_stage.get('stage') or last_stage.get('playbook') or 'stage'
+        print(f'Last setup stage: {label} ({last_stage.get("status")}, {last_stage.get("seconds")}s)', flush=True)
+    if failed_stages:
+        for row in failed_stages[-3:]:
+            label = row.get('stage') or row.get('playbook') or 'stage'
+            print(f'Failed stage: {label} ({row.get("seconds")}s)', flush=True)
+    print('Next:', flush=True)
+    print(nxt, flush=True)
+    return report
+
+
+def validate_plan(document, project, destroy=False, create_only=False):
+    """Validate actual resource identities, not just the directory/plan summary."""
+    changes = document.get('resource_changes', [])
+    for change in changes:
+        address = change['address']
+        if address not in RESOURCE_NAMES or change.get('mode', 'managed') != 'managed':
+            raise ValueError(f'Refusing Terraform resource outside this company environment: {address}')
+        actions = change['change']['actions']
+        allowed = ((['delete'], ['no-op']) if destroy else
+                   (['create'], ['no-op']) if create_only else (['create'], ['update'], ['no-op']))
+        if actions not in allowed:
+            raise ValueError(f'Refusing unexpected actions on {address}: {actions}')
+        for value in (change['change'].get('before'), change['change'].get('after')):
+            if value is None:
+                continue
+            if value.get('name') != RESOURCE_NAMES[address] or value.get('project') != project:
+                raise ValueError(f'Refusing unexpected resource name/project at {address}')
+            resource_id = value.get('id')
+            if resource_id and not resource_id.startswith(f'projects/{project}/'):
+                raise ValueError(f'Refusing resource ID outside configured project at {address}')
+    return {action: sum(action in change['change']['actions'] for change in changes)
+            for action in ('create', 'update', 'delete')}
+
+
+def validate_nodes(nodes):
+    if set(nodes) != set(NAMES):
+        raise ValueError('Terraform must return exactly the two configured company nodes')
+    for name, node in nodes.items():
+        ipaddress.IPv4Address(node['public_ip'])
+        ipaddress.IPv4Address(node['private_ip'])
+        if node['zone'] != ZONES[name] or node['status'] != 'RUNNING' or not node.get('instance_id'):
+            raise ValueError(f'{name}: unexpected location, power state or missing instance identity')
+    if nodes[NAMES[0]]['public_ip'] == nodes[NAMES[1]]['public_ip']:
+        raise ValueError('Terraform returned duplicate machine addresses')
+    return hashlib.sha256(json.dumps(nodes, sort_keys=True).encode()).hexdigest()[:20]
+
+
+class Workflow:
+    def __init__(self, config_path, run_dir):
+        self.config_path = config_path.resolve()
+        self.config = json.loads(config_path.read_text())
+        from certlocker_gateway import GatewayRoutes
+        self.config['trust_account_id'] = GatewayRoutes(self.config.get('trust_account_id')).account_id
+        self.run_dir = run_dir
+        self.log = run_dir / 'commands.log'
+        self.evidence = {'started_at': timestamp(), 'status': 'running', 'cycles': []}
+        self.started_monotonic = time.monotonic()
+        self.until = 'apps'
+        self.machine_type = 'e2-standard-2'
+        self.boot_disk_size_gb = 100
+        self.action = 'up'
+        self.progress = Progress('certlocker')
+        self.ssh_keys = ExitStack()
+        self.evidence['source_sha256'] = {
+            path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
+            for path in ('scripts/uncloud', 'scripts/uncloud_config.py', 'scripts/uncloud_install_preflight.py', 'scripts/uncloud_install_notification.py', 'scripts/uncloud_install_receipt.py', 'scripts/uncloud_customer_archive.py', 'scripts/uncloud_ssh.py', 'scripts/setup-ha', 'scripts/test-ha-certificates', 'scripts/uncloud_certificates.py', 'scripts/uncloud_dns.py', 'scripts/configure-ha-cloudflare', 'scripts/uncloud_cloudflare.py', 'scripts/configure-ha-monitoring-dns', 'scripts/uncloud_support.py', 'scripts/uncloud_enrollment.py', 'scripts/uncloud_progress.py', 'scripts/uncloud_smtp.py', 'scripts/uncloud_preflight.py', 'playbooks/uncloud_certificate_seed.yml', 'playbooks/uncloud_certificate_automation.yml', 'playbooks/ops/files/uncloud_verify.py', 'playbooks/ops/files/uncloud_certificate_activate.py', 'uncloud/monitoring/compose.yaml.j2', 'uncloud/monitoring/alertmanager.yml.j2', 'uncloud/monitoring/google_chat_webhook.py', 'uncloud/ingress/haproxy.cfg.j2', 'playbooks/uncloud_ingress.yml', 'uncloud/monitoring/prometheus.yml.j2', 'playbooks/uncloud_bootstrap.yml', 'playbooks/uncloud_host_verify.yml', 'roles/docker/tasks/main.yml', 'roles/docker/handlers/main.yml', 'playbooks/ops/files/uncloud_docker_prune.py', 'playbooks/uncloud_monitoring.yml', 'uncloud/monitoring/images.json', 'uncloud/monitoring/loki-config.yaml.j2', 'uncloud/monitoring/alloy.config.alloy.j2', 'terraform/gcp-uncloud/main.tf', 'terraform/gcp-uncloud/variables.tf', 'playbooks/uncloud_database.yml', 'playbooks/ops/files/uncloud_database_start.sh', 'uncloud/database/compose.yaml.j2', 'playbooks/uncloud_apps_router_proxy.yml', 'playbooks/uncloud_apps.yml', 'roles/certlocker_stack/templates/dataservice.application.json.j2', 'playbooks/uncloud_apps_failover.yml', 'playbooks/ops/files/uncloud_watchdog.py', 'playbooks/ops/files/uncloud_router_proxy.py', 'playbooks/ops/files/uncloud_apps_verify.py', 'uncloud/router-proxy/compose.yaml.j2', 'uncloud/router-proxy/wait-for-router.lua', 'uncloud/apps/compose.yaml.j2')}
+        self.save()
+
+    def save(self):
+        private_json(self.run_dir / 'result.json', self.evidence)
+
+    def command(self, args, capture=False, env=None):
+        started = time.monotonic()
+        status = 'failed'
+        try:
+            result = self._command(args, capture, env)
+            status = 'passed'
+            return result
+        finally:
+            self.evidence.setdefault('command_timings', []).append({
+                'command': [str(value) for value in args], 'status': status,
+                'seconds': round(time.monotonic() - started, 3)})
+            self.save()
+
+    def _command(self, args, capture=False, env=None):
+        command = list(map(str, args))
+        print('+ ' + ' '.join(command), flush=True)
+        with self.log.open('a') as log:
+            log.write('\n+ ' + ' '.join(map(str, args)) + '\n')
+            log.flush()
+            if capture:
+                result = subprocess.run(command, cwd=ROOT, stdin=subprocess.DEVNULL,
+                                        text=True, stdout=subprocess.PIPE, stderr=log, env=env)
+                if result.returncode:
+                    raise RuntimeError(f'{args[0]} failed (exit {result.returncode}); see {self.log}')
+                return result.stdout
+            process = subprocess.Popen(command, cwd=ROOT, stdin=None if getattr(self,'interactive_setup',False) and str(args[0]).endswith('/setup-ha') else subprocess.DEVNULL,
+                                       text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       bufsize=1, env=env)
+            for line in process.stdout:
+                log.write(line)
+                log.flush()
+                print(line, end='', flush=True)
+            if process.wait():
+                raise RuntimeError(f'{args[0]} failed (exit {process.returncode}); see {self.log}')
+        return ''
+
+    def tf(self, *args, capture=False):
+        # Use the working CLI identity rather than an unrelated/stale ADC login.
+        # Refresh for each Terraform process; never put bearer tokens in argv,
+        # files, logs, Terraform variables, plans or state.
+        token = self.command(['gcloud', 'auth', 'print-access-token', '--quiet'], capture=True).strip()
+        if not token:
+            raise ValueError('Google CLI returned an empty access token')
+        env = dict(os.environ, GOOGLE_OAUTH_ACCESS_TOKEN=token)
+        for name in list(env):
+            if name.startswith('TF_LOG'):
+                del env[name]
+        return self.command(['terraform', f'-chdir={TERRAFORM}', *args], capture, env=env)
+
+    def prepare(self):
+        # Fail before contacting Trust or changing infrastructure when the
+        # operator's controller is missing a required CLI.
+        with self.progress.stage('Check Google access, environment ownership and saved configuration'):
+            from uncloud_preflight import check_controller
+            self.progress.detail('Checking local controller tools')
+            if self.action == 'destroy':
+                for command in ['terraform', 'gcloud', 'ssh', 'ssh-keygen']:
+                    if not shutil.which(command):
+                        raise ValueError(f'Missing controller prerequisite: {command}')
+            else:
+                self.progress.detail('Checking controller readiness')
+                check_controller(require_google=True, require_terraform=True)
+            if not TERRAFORM.is_dir():
+                raise ValueError(f'Missing Terraform environment: {TERRAFORM}')
+            require_deployment(self.config)
+            for name in NAMES:
+                if self.config['nodes'][name]['zone'] != ZONES[name]:
+                    raise ValueError('Company environment zones differ from the selected resource locations')
+            if not self.config.get('google_project'):
+                raise ValueError('google_project must be explicit')
+            cidrs = self.config.get('operator_cidrs', [])
+            if not cidrs or any(ipaddress.ip_network(c).version != 4 or
+                                ipaddress.ip_network(c).prefixlen != 32 for c in cidrs):
+                raise ValueError('Explicit operator IPv4 /32 CIDRs are required')
+            vpn_cidrs = with_updater(self.config.get('vpn_cidrs', []))
+            if any(ipaddress.ip_network(c).version != 4 or ipaddress.ip_network(c).prefixlen != 32
+                   for c in vpn_cidrs):
+                raise ValueError('VPN access requires explicit IPv4 /32 CIDRs')
+            if self.config.get('ssh_user', 'ucdeploy') != 'ucdeploy':
+                raise ValueError('This environment uses the dedicated ucdeploy SSH user, never root')
+            if self.action != 'destroy' and self.until in ('database', 'apps'):
+                from uncloud_support import Trust, DEFAULT_GHCR_SECRET_NAME, trust_name
+                self.progress.detail('Checking company Trust authorization')
+                trust = Trust(account_id=self.config.get('trust_account_id'))
+                # Check Trust authorization before deleting any machines. Do not
+                # print or persist the resolved shared pull credential.
+                trust.check_authorization(COMPANY, interactive=getattr(self, 'interactive_setup', False))
+                if self.until == 'apps':
+                    self.progress.detail('Checking shared registry credential in Trust')
+                    registry_secret = trust.get(self.config.get('ghcr_secret_name') or os.environ.get('CERTLOCKER_GHCR_SECRET_NAME') or DEFAULT_GHCR_SECRET_NAME)
+                    if not isinstance(registry_secret,str) or not registry_secret.strip():
+                        raise ValueError('The shared GHCR pull credential is unavailable from Trust')
+                    del registry_secret
+            # Authenticate before any destroy. If the existing gcloud session has
+            # expired, start OAuth in the operator's terminal and retry the check.
+            self.progress.detail('Checking Google project access')
+            try:
+                self.command(['gcloud', 'compute', 'project-info', 'describe', '--project',
+                              self.config['google_project'], '--format=value(name)', '--quiet'], capture=True)
+            except RuntimeError as error:
+                if not getattr(self, 'interactive_setup', False) or not can_prompt():
+                    raise RuntimeError('Google access preflight failed before teardown. Run '
+                                       '`gcloud auth login --update-adc` in your terminal, then retry. '
+                                       'This unattended invocation made no infrastructure changes. ' + str(error)) from None
+                print('Google authentication needs attention; starting gcloud login now.', flush=True)
+                login = subprocess.run(['gcloud', 'auth', 'login', '--update-adc'],
+                                       cwd=ROOT, check=False)
+                if login.returncode:
+                    raise RuntimeError(f'gcloud auth login failed (exit {login.returncode}); '
+                                       'no infrastructure was changed') from None
+                try:
+                    self.command(['gcloud', 'compute', 'project-info', 'describe', '--project',
+                                  self.config['google_project'], '--format=value(name)', '--quiet'], capture=True)
+                except RuntimeError as retry_error:
+                    raise RuntimeError('Google access preflight still fails after login; check the active account '
+                                       'and project access. No infrastructure was changed. ' + str(retry_error)) from None
+        if self.action == 'up':
+            with self.progress.stage('Check Google billing, provisioning permissions and both VM locations'):
+                self.progress.detail('Validating zones, machine types and billing quotas')
+                self.command([sys.executable, ROOT/'scripts/prepare-ha-workstation',
+                    '--project',self.config['google_project'],
+                    '--zone-1',ZONES[NAMES[0]],'--zone-2',ZONES[NAMES[1]],
+                    '--machine-type-1',self.config['nodes'][NAMES[0]].get('machine_type',self.machine_type),
+                    '--machine-type-2',self.config['nodes'][NAMES[1]].get('machine_type',self.machine_type),
+                    '--check-only','--non-interactive','--provision-lab'],capture=True)
+        if self.action != 'destroy' and self.until == 'apps':
+            from uncloud_install_preflight import check_dependencies
+            from uncloud_support import Trust
+            with self.progress.stage('Check certificates, Cloudflare routing, application mail and the pinned release before provisioning'):
+                readiness = check_dependencies(COMPANY, Trust(group=TRUST_GROUP, account_id=self.config.get('trust_account_id')), self.config, STATE,
+                                               interactive=getattr(self,'interactive_setup',False),
+                                               progress=self.progress)
+            self.bootstrap_manifest = readiness['manifest_file']
+            self.evidence['dependency_preflight'] = readiness
+            private_json(self.config_path,self.config)
+            self.save()
+        with self.progress.stage('Prepare Terraform workspace and SSH identity'):
+            self.progress.detail('Retrieve the provisioning identity from operator Trust')
+            public = self.prepare_ssh_identity()
+            self.var_file = self.run_dir / 'uncloud.tfvars.json'
+            private_json(self.var_file, {'project_id': self.config['google_project'],
+                                        'operator_cidrs': self.config.get('operator_cidrs', []),
+                                        'ssh_public_key': public,
+                                        'ssh_user': self.config.get('ssh_user', 'ucdeploy'),
+                                        'deployment': require_deployment(self.config),
+                                        'company': COMPANY, 'resource_prefix': NETWORK_NAME, 'machine_names': MACHINE_NAMES, 'resource_suffixes': RESOURCE_SUFFIXES,
+                                        'zones': ZONES, 'machine_types': {node:self.config['nodes'][node].get('machine_type',self.machine_type) for node in NAMES},
+                                        'machine_type': self.machine_type,
+                                        'boot_disk_size_gb': self.boot_disk_size_gb,
+                                        'machine_status': {name: 'RUNNING' for name in NAMES}})
+            self.progress.detail('Initializing and validating Terraform')
+            self.tf('init', '-input=false', '-no-color')
+            if self.tf('workspace', 'show', capture=True).strip() != 'default':
+                raise ValueError('Only the dedicated default local Terraform workspace is supported')
+            self.tf('validate', '-no-color')
+
+    def prepare_ssh_identity(self):
+        from uncloud_host_access import setup_key, destroy_public_key
+        if self.action == 'destroy':
+            return destroy_public_key(self.config, STATE, TERRAFORM)
+        if not hasattr(self, 'ssh_keys'):
+            self.ssh_keys = ExitStack()
+        allow_create = self.action in ('up', 'rebuild') and not _terraform_has_resources(strict=True)
+        if allow_create:
+            # Older teardown runs revoked Trust but left this identity binding.
+            # Empty local state alone cannot prove its servers are gone.
+            self.progress.detail('Checking that Google resources are absent before preparing a fresh provisioning identity')
+            self.verify_google_lab_empty()
+            self.retire_provisioning_checkpoint()
+        return self.ssh_keys.enter_context(setup_key(
+            COMPANY, self.config, STATE,
+            allow_create=allow_create))
+
+    def retire_provisioning_checkpoint(self):
+        """Keep the old public binding as evidence after verified teardown."""
+        snapshot = STATE / 'provisioning-key.json'
+        if snapshot.exists():
+            private_json(self.run_dir / 'retired-provisioning-key.json', json.loads(snapshot.read_text()))
+            snapshot.unlink()
+
+    def retire_installation_inventory(self):
+        """Archive the active inventory only after verified infrastructure teardown."""
+        from uncloud_support import inventory_directory
+        directory = inventory_directory(COMPANY)
+        if not directory.exists():
+            return
+        marker = directory / '.setup.json'
+        try:
+            identity = json.loads(marker.read_text())
+            owned = (isinstance(identity, dict) and identity.get('company') == COMPANY and
+                     Path(identity['state_dir']).resolve().is_relative_to(STATE.resolve()))
+        except (OSError, ValueError, KeyError, TypeError):
+            owned = False
+        if directory.is_symlink() or not owned:
+            raise ValueError('Local inventory is not owned by this environment; refusing to retire it')
+        archive = self.run_dir / 'retired-inventory'
+        if archive.exists():
+            raise ValueError('Retired inventory archive already exists; refusing to overwrite it')
+        shutil.move(str(directory), str(archive))
+        print('Verified teardown inventory archived; the company can be installed again.', flush=True)
+
+    def gcloud_rows(self, *args):
+        value = json.loads(self.command(['gcloud', *args, '--format=json', '--quiet'], capture=True))
+        if not isinstance(value, list):
+            raise ValueError('Google resource discovery returned an incomplete result')
+        return value
+
+    def state_resources(self):
+        # This workflow enforces the default workspace and a local backend.
+        # Terraform state list exits 1 before the first apply; absence is normal
+        # during an initial cleanup, but other state errors must still fail.
+        if not (TERRAFORM / 'terraform.tfstate').exists():
+            return set()
+        return set(self.tf('state', 'list', capture=True).split())
+
+    def import_untracked_resources(self):
+        """Adopt only exact, configuration-matching lab resources before destroy."""
+        project = self.config['google_project']
+        network_name = NETWORK_NAME
+        state = self.state_resources()
+        if state - set(RESOURCE_NAMES):
+            raise ValueError('Terraform state contains resources outside the isolated lab allowlist')
+        imports = []
+
+        networks = self.gcloud_rows('compute', 'networks', 'list', '--project', project,
+                                    '--filter=name=' + network_name)
+        for row in networks:
+            if row.get('name') != network_name or row.get('autoCreateSubnetworks') is not False or row.get('mtu') != 1460:
+                raise ValueError('An unexpected VPC uses the isolated lab network name; refusing teardown')
+            imports.append(('google_compute_network.lab',
+                            f'projects/{project}/global/networks/{network_name}'))
+
+        subnets = self.gcloud_rows('compute', 'networks', 'subnets', 'list', '--project', project,
+                                   '--filter=name~^' + network_name + '-')
+        for row in subnets:
+            node = next((item for item in NAMES if row.get('name') == network_name + '-' + RESOURCE_SUFFIXES[item]), None)
+            network = row.get('network', '').rstrip('/').split('/')[-1]
+            region = row.get('region', '').rstrip('/').split('/')[-1]
+            if (node is None or network != network_name or region != REGIONS[node] or
+                    row.get('ipCidrRange') != CIDRS[node]):
+                raise ValueError('An unexpected subnet uses the isolated lab resource prefix; refusing teardown')
+            imports.append((f'google_compute_subnetwork.lab["{node}"]',
+                            f'projects/{project}/regions/{REGIONS[node]}/subnetworks/{network_name}-{RESOURCE_SUFFIXES[node]}'))
+
+        firewalls = self.gcloud_rows('compute', 'firewall-rules', 'list', '--project', project,
+                                     '--filter=name~^' + network_name + '-')
+        for row in firewalls:
+            name = row.get('name')
+            if (name not in {network_name + '-operator', network_name + '-mesh', network_name + '-origins'} or
+                    row.get('network', '').rstrip('/').split('/')[-1] != network_name):
+                raise ValueError('An unexpected firewall uses the isolated lab resource prefix; refusing teardown')
+            address = 'operator' if name.endswith('-operator') else 'mesh' if name.endswith('-mesh') else 'origins'
+            imports.append((f'google_compute_firewall.{address}', f'projects/{project}/global/firewalls/{name}'))
+
+        addresses = self.gcloud_rows('compute', 'addresses', 'list', '--project', project,
+                                     '--filter=name~^' + network_name + '-')
+        for row in addresses:
+            node = next((item for item in NAMES if row.get('name') == network_name + '-' + RESOURCE_SUFFIXES[item]), None)
+            region = row.get('region', '').rstrip('/').split('/')[-1]
+            if node is None or region != REGIONS[node]:
+                raise ValueError('An unexpected address uses the isolated lab resource prefix; refusing teardown')
+            imports.append((f'google_compute_address.node["{node}"]',
+                            f'projects/{project}/regions/{REGIONS[node]}/addresses/{network_name}-{RESOURCE_SUFFIXES[node]}'))
+
+        instances = self.gcloud_rows('compute', 'instances', 'list', '--project', project,
+                                     '--filter=name=(' + ' '.join(MACHINE_NAMES.values()) + ')')
+        for row in instances:
+            node = next((key for key,value in MACHINE_NAMES.items() if value == row.get('name')), None)
+            zone = row.get('zone', '').rstrip('/').split('/')[-1]
+            if (node not in NAMES or zone != ZONES[node] or network_name not in row.get('tags', {}).get('items', [])):
+                raise ValueError('An unexpected instance uses the isolated lab name; refusing teardown')
+            labels = row.get('labels', {})
+            if labels and (labels.get('environment') != COMPANY or labels.get('managed-by') != 'terraform'):
+                raise ValueError('Lab instance labels differ from the expected owner; refusing teardown')
+            imports.append((f'google_compute_instance.node["{node}"]',
+                            f'projects/{project}/zones/{ZONES[node]}/instances/{MACHINE_NAMES[node]}'))
+
+        # Importing is read-only with respect to Google resources. It repairs
+        # local state so the validated destroy plan can remove a partial apply.
+        for address, resource_id in imports:
+            if address in state:
+                continue
+            print(f'Recovering Terraform state for {address} before teardown.', flush=True)
+            self.tf('import', '-input=false', '-no-color', f'-var-file={self.var_file}', address, resource_id)
+
+    def verify_google_lab_empty(self):
+        project = self.config['google_project']
+        checks = [
+            ('compute', 'instances', 'list', '--project', project, '--filter=name=(' + ' '.join(MACHINE_NAMES.values()) + ')'),
+            ('compute', 'disks', 'list', '--project', project, '--filter=name=(' + ' '.join(MACHINE_NAMES.values()) + ')'),
+            ('compute', 'networks', 'list', '--project', project, '--filter=name=' + NETWORK_NAME),
+            ('compute', 'networks', 'subnets', 'list', '--project', project,
+             '--filter=name=(' + ' '.join(NETWORK_NAME+'-'+suffix for suffix in RESOURCE_SUFFIXES.values()) + ')'),
+            ('compute', 'firewall-rules', 'list', '--project', project,
+             '--filter=name=(' + ' '.join(NETWORK_NAME+'-'+key for key in ('operator','mesh','origins')) + ')'),
+            ('compute', 'addresses', 'list', '--project', project,
+             '--filter=name=(' + ' '.join(NETWORK_NAME+'-'+suffix for suffix in RESOURCE_SUFFIXES.values()) + ')'),
+        ]
+        leftovers = []
+        for args in checks:
+            rows = self.gcloud_rows(*args)
+            leftovers.extend(row.get('name', 'unknown') for row in rows)
+        if leftovers:
+            raise ValueError('Google still has lab resources after Terraform destroy: ' + ', '.join(leftovers))
+
+    def delete_orphaned_boot_disks(self):
+        project = self.config['google_project']
+        disks = self.gcloud_rows('compute', 'disks', 'list', '--project', project,
+                                 '--filter=name=(' + ' '.join(MACHINE_NAMES.values()) + ')')
+        for disk in disks:
+            node = next((key for key,value in MACHINE_NAMES.items() if value == disk.get('name')), None)
+            zone = disk.get('zone', '').rstrip('/').split('/')[-1]
+            disk_type = disk.get('type', '').rstrip('/').split('/')[-1]
+            source = disk.get('sourceImage', '')
+            if (node not in NAMES or zone != ZONES[node] or disk_type != 'pd-standard' or
+                    int(disk.get('sizeGb',0)) != self.boot_disk_size_gb or 'ubuntu-os-cloud' not in source or
+                    disk.get('users')):
+                raise ValueError('Unattached Google disk does not match the disposable lab boot disk; refusing deletion')
+            print(f'Removing unattached orphaned boot disk {node} in {zone}.', flush=True)
+            self.command(['gcloud', 'compute', 'disks', 'delete', MACHINE_NAMES[node], '--project', project,
+                          '--zone', zone, '--quiet'])
+
+    def apply(self, destroy=False, create_only=False):
+        if destroy:
+            self.import_untracked_resources()
+        plan = self.run_dir / ('destroy.tfplan' if destroy else 'create.tfplan')
+        args = ['plan', '-input=false', '-no-color', f'-var-file={self.var_file}', f'-out={plan}']
+        if destroy:
+            args.append('-destroy')
+        self.tf(*args)
+        document = json.loads(self.tf('show', '-json', plan, capture=True))
+        counts = validate_plan(document, self.config['google_project'], destroy, create_only=create_only)
+        print('Validated isolated lab plan: ' + json.dumps(counts), flush=True)
+        if destroy and getattr(self, 'remove_dns', False):
+            addresses = {node: change['change']['before']['address']
+                         for node in NAMES for change in document.get('resource_changes', [])
+                         if change['address'] == 'google_compute_address.node["' + node + '"]'
+                         and change['change'].get('before')}
+            active_path = STATE / 'active.json'
+            active = json.loads(active_path.read_text()) if active_path.exists() else {}
+            if set(addresses) != set(NAMES) and set(active.get('nodes', {})) == set(NAMES):
+                addresses = {name: active['nodes'][name]['public_ip'] for name in NAMES}
+            from uncloud_support import Trust, trust_name
+            from uncloud_certificates import cloudflare_preflight
+            from uncloud_dns import Records, remove_owned
+            from uncloud_cloudflare import Cloudflare, remove_monitoring_dns
+            trust = Trust(group=TRUST_GROUP, account_id=self.config.get('trust_account_id'))
+            token, zone = cloudflare_preflight(
+                COMPANY, trust, DNS_ZONE, fallback_token=os.environ.get('CLOUDFLARE_API_TOKEN'))
+            dns_evidence = {}
+            api = Cloudflare(token)
+            ingress = trust.get(trust_name(COMPANY, 'vault_certlocker_ingress_settings'))
+            if isinstance(ingress, dict) and ingress.get('grafana_hostname'):
+                dns_evidence['grafana_dns'] = remove_monitoring_dns(
+                    api, zone, COMPANY, ingress['grafana_hostname'])
+            # Setup can fail after creating a monitor/pool but before active.json.
+            # Discover exact owned resources on every explicit DNS teardown, including
+            # older hashed pools left after hostname changes.
+            from uncloud_cloudflare import check_access, remove_company_routing
+            account = check_access(api, zone, DNS_ZONE)
+            routing_names = LAB_NAMES
+            if isinstance(ingress, dict) and ingress.get('hostname') and ingress.get('backoffice_hostname'):
+                routing_names = (ingress['hostname'], ingress['backoffice_hostname'])
+            dns_evidence['load_balancing'] = remove_company_routing(
+                api, zone, account, COMPANY, DNS_ZONE, routing_names,
+                addresses if set(addresses) == set(NAMES) else None)
+            dns_evidence['a_records'] = remove_owned(
+                Records(token, zone), addresses if set(addresses) == set(NAMES) else None)
+            self.evidence['dns_teardown'] = dns_evidence
+            self.save()
+            print('Owned load balancing and DNS records removed before releasing origin addresses.', flush=True)
+        with self.progress.stage('Remove the company infrastructure' if destroy else 'Create both Ubuntu servers, their network, IP addresses and firewall rules'):
+            self.tf('apply', '-input=false', '-no-color', plan)
+        if destroy:
+            remaining = self.state_resources()
+            if remaining:
+                raise ValueError('Destroy left tracked resources; refusing to start another build')
+            self.delete_orphaned_boot_disks()
+            self.verify_google_lab_empty()
+            if getattr(self, 'remove_trust', False):
+                from uncloud_support import (Trust, discover_host_trust_names, inventory_directory,
+                                             revoke_company_trust)
+                with self.progress.stage('Revoke company Trust secrets for this environment'):
+                    extras = discover_host_trust_names(
+                        COMPANY, inventory_directory(COMPANY), STATE, STATE / 'installations')
+                    trust = Trust(group=TRUST_GROUP, account_id=self.config.get('trust_account_id'))
+                    self.evidence['trust_teardown'] = revoke_company_trust(
+                        COMPANY, trust, extra_names=extras, progress=self.progress)
+                    self.save()
+                    self.retire_provisioning_checkpoint()
+                    print('Company Trust secrets revoked after infrastructure teardown.', flush=True)
+            self.retire_installation_inventory()
+        return counts
+
+    def up(self, cycle):
+        if self.action == 'resume':
+            outputs = json.loads(self.tf('output','-json',capture=True))
+            if 'nodes' not in outputs:
+                tracked = self.state_resources()
+                if not tracked:
+                    raise ValueError('No infrastructure exists to resume. Retry preflight/provisioning with up --config ' + str(self.config_path))
+                print('Complete the interrupted provisioning using a create-only plan; existing resources cannot be replaced or updated.',flush=True)
+                cycle['create'] = self.apply(create_only=True)
+            else:
+                cycle['create'] = {'status':'existing infrastructure reused'}
+        else:
+            cycle['create'] = self.apply()
+        nodes = json.loads(self.tf('output', '-json', 'nodes', capture=True))
+        generation = validate_nodes(nodes)
+        state_dir = STATE / 'installations' / generation
+        config = dict(self.config)
+        if self.until == 'apps':
+            from uncloud_support import Trust, inventory_directory, trust_name
+
+            trust = Trust(group=TRUST_GROUP, account_id=self.config.get('trust_account_id'))
+            marker = inventory_directory(COMPANY) / '.setup.json'
+            if marker.exists() and json.loads(marker.read_text())['state_dir'] == str(state_dir):
+                names = trust.get(trust_name(COMPANY, 'vault_certlocker_ingress_settings'))
+                if any(names.get(key)!=value for key,value in zip(('hostname','backoffice_hostname'),LAB_NAMES)):
+                    raise ValueError('New lab DNS names require a fresh pair; use rebuild, not up on the original pair')
+            desired = dict(zip(('hostname','backoffice_hostname'),LAB_NAMES))
+            desired['grafana_hostname'] = self.config.get('grafana_url','https://grafana-cl.'+DNS_ZONE).removeprefix('https://')
+            if trust.get(trust_name(COMPANY,'vault_certlocker_ingress_settings')) != desired:
+                raise ValueError('Company ingress changed after preflight; refusing to overwrite it')
+            config.update(certificate_mode='customer', dns_zone=DNS_ZONE,
+                          acme_email=self.config.get('acme_email','admin@example.com'), store_ssh_key=True,
+                          cloudflare_load_balancing=True, cloudflare_monitor_interval=60)
+        config['hosting'] = {'provider': 'google', 'project': self.config['google_project'],
+                             'zones': {name: nodes[name]['zone'] for name in NAMES}}
+        config['nodes'] = {name: {'expected_hostname': MACHINE_NAMES[name],
+                                'wireguard_endpoint': nodes[name]['private_ip']}
+                           for name in NAMES}
+        # Terraform is only our test harness. Exercise the customer installation
+        # path with supplied addresses/key, never cloud discovery or metadata.
+        config.pop('google_project', None)
+        binding = state_dir/'installation.json'
+        if self.action == 'resume' and binding.exists():
+            saved = json.loads(binding.read_text())
+            if saved.get('company') != COMPANY or sorted(saved.get('addresses',[])) != sorted(nodes[node]['public_ip'] for node in NAMES):
+                raise ValueError('Saved installation does not match the existing Terraform servers')
+            config = saved['config']
+        install_config = state_dir / 'install.json'
+        private_json(install_config, config)
+        addresses = [nodes[name]['public_ip'] for name in NAMES]
+        cycle.update(nodes=nodes, state_dir=str(state_dir), generation=generation)
+        self.save()
+        command = [ROOT / 'scripts/setup-ha', COMPANY, *addresses,
+                   'provider_1=supplied', 'provider_2=supplied', '--config', install_config,
+                   '--state-dir', state_dir, '--replace-inventory', '--until', self.until]
+        if self.config.get('reuse_issued_certificate'):
+            # Explicit recovery choice; keep the original machine/config binding intact.
+            command.append('--reuse-issued-certificate')
+        if getattr(self,'bootstrap_manifest',None):
+            command.extend(['--manifest-file',self.bootstrap_manifest])
+        if not getattr(self, 'interactive_setup', False):
+            command.append('--non-interactive')
+        # Resume continues from timings-setup.json instead of replaying passed stages.
+        if self.action == 'resume':
+            command.append('--continue')
+        self.command(command)
+        cycle['setup_timings'] = json.loads((state_dir / 'timings-setup.json').read_text())
+        cycle['install_passed'] = True
+        if self.until == 'apps':
+            from uncloud_support import inventory_directory
+            cycle['initial_release'] = json.loads((inventory_directory(COMPANY) / 'release.json').read_text())
+        cycle['installer_path'] = 'supplied-servers-no-cloud-sdk-or-metadata'
+        cycle['verified_through'] = self.until
+        self.save()
+        self.command([*command, '--verify-only', '--non-interactive'])
+        cycle['verification_timings'] = json.loads((state_dir / 'timings-verify.json').read_text())
+        cycle['verify_passed'] = True
+        if self.until == 'apps':
+            from uncloud_dns import Records, remove_owned
+            from uncloud_certificates import cloudflare_preflight
+            from uncloud_cloudflare import Cloudflare, check_access, plan, verify
+            from uncloud_support import Trust
+            cycle['certificate'] = json.loads((state_dir / 'certificate-bootstrap.json').read_text())
+            dns_started = time.monotonic()
+            trust = Trust(group=TRUST_GROUP, account_id=self.config.get('trust_account_id'))
+            token, zone_id = cloudflare_preflight(COMPANY, trust, DNS_ZONE)
+            cloudflare = Cloudflare(token)
+            account_id = check_access(cloudflare, zone_id, DNS_ZONE)
+            addresses_by_node = dict(zip(NAMES, addresses))
+            lb_settings = plan(COMPANY, DNS_ZONE, LAB_NAMES, addresses_by_node, 60)
+            cycle['dns'] = verify(cloudflare, zone_id, account_id, lb_settings)
+            cycle['dns']['mode'] = 'Cloudflare Load Balancing with cookie session affinity'
+            cycle['dns']['origin_a_records_removed'] = remove_owned(Records(token, zone_id), addresses_by_node)
+            cycle['dns']['seconds'] = round(time.monotonic() - dns_started, 3)
+            self.save()
+            if getattr(self, 'skip_failover', False):
+                cycle['failover'] = {'status': 'not_run', 'reason': 'setup-only run requested'}
+                print('Setup-only run: destructive failover drills were not requested.', flush=True)
+            cycle['final_release'] = json.loads((inventory_directory(COMPANY) / 'release.json').read_text())
+        # Same public exposure smoke test on every independently created pair.
+        for address in addresses:
+            try:
+                with socket.create_connection((address, 5432), timeout=3):
+                    raise ValueError(f'Unexpected public database access at {address}')
+            except OSError:
+                pass
+        acceptance_passed = cycle.get('failover', {}).get('passed', True)
+        cycle.update(public_database_closed=True, finished_at=timestamp(),
+                     status='passed' if acceptance_passed else 'failed')
+        active = {'nodes': nodes, 'state_dir': str(state_dir),
+                                           'generation': generation, 'verified_at': timestamp(),
+                                           'cloudflare_load_balancing': self.until == 'apps',
+                                           'failover_tested': not getattr(self, 'skip_failover', False) and self.until == 'apps',
+                                           'acceptance_passed': acceptance_passed}
+        private_json(STATE / 'active.json', active)
+        if self.until == 'apps' and acceptance_passed:
+            from uncloud_install_receipt import collect_public_ips, archive_installation
+            with self.progress.stage('Read each server public IP and save the successful installer JSON in both Trust instances'):
+                collect_public_ips(self.config, cycle)
+                self.save()
+                try:
+                    cycle['installation_trust'] = archive_installation(
+                        COMPANY, self.config, cycle, self.config_path, install_config)
+                except (ValueError, KeyError, RuntimeError, OSError):
+                    raise RuntimeError('Installation checks passed, but saving the installer JSON in both Trust instances '
+                                       'was not confirmed. Check Trust access and resume; no success notification was sent') from None
+                active['installation_trust'] = cycle['installation_trust']
+                private_json(STATE / 'active.json', active)
+                self.save()
+            from uncloud_install_notification import notify_installation
+            cycle['installation_notification'] = notify_installation(
+                COMPANY, self.config, cycle, MACHINE_NAMES, self.machine_type, self.boot_disk_size_gb)
+        self.save()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['up', 'resume', 'destroy', 'check', 'clean'])
+    parser.add_argument('--config', type=Path, help='Explicit company environment file; used for check, resume, destroy and unattended up')
+    parser.add_argument('--json', action='store_true', help='With check: print machine-readable status JSON after the summary')
+    parser.add_argument('--deployment', choices=['dev', 'prod'], help='Override or set deployment type (dev or prod)')
+    parser.add_argument('--until', choices=['harden', 'network', 'database', 'apps'], default='apps')
+    parser.add_argument('--machine-type', choices=['e2-standard-2', 'e2-standard-4', 'e2-standard-8'],
+                        default=None, help='Base type for each Google VM; default e2-standard-2')
+    parser.add_argument('--boot-disk-size-gb', type=int, default=None,
+                        help='Persistent boot disk size per VM in GiB; default 100')
+    parser.add_argument('--operator-cidr', default='auto', help='SSH source IPv4 /32; default discovers the current public address')
+    parser.add_argument('--vpn-cidr', action='append', help='Additional customer monitoring IPv4 /32; certlocker updater is included automatically')
+    parser.add_argument('--remove-dns', action='store_true', help='During teardown, remove only this environment\'s owned DNS records; requires CERTLOCKER_TOKEN')
+    parser.add_argument('--remove-trust', action='store_true', help='During teardown, revoke this company\'s Trust secrets at trust.certlocker.io; requires CERTLOCKER_TOKEN')
+    parser.add_argument('--preflight-only', action='store_true', help='Check saved company settings and external dependencies without creating or installing servers')
+    parser.add_argument('--non-interactive', action='store_true', help='Use an explicit company environment file without the fresh-answer wizard')
+    parser.add_argument('--all', dest='all_companies', action='store_true',
+                        help='With clean: remove every local company environment file, controller state and inventory leftover')
+    parser.add_argument('--yes', action='store_true',
+                        help='With clean: skip the confirmation prompt')
+    parser.add_argument('--force', action='store_true',
+                        help='With clean: delete local files even when Terraform state still lists resources (does not destroy cloud VMs)')
+    parser.set_defaults(cycles=1, skip_failover=True, test_failover=False)
+    args = parser.parse_args(argv)
+    if getattr(args, 'json') and args.action != 'check':
+        parser.error('--json is only valid with check')
+    if args.preflight_only and args.action not in ('up','resume'):
+        parser.error('--preflight-only requires up or resume')
+    if args.remove_dns and args.action == 'up':
+        parser.error('--remove-dns is a teardown option')
+    if args.remove_trust and args.action == 'up':
+        parser.error('--remove-trust is a teardown option')
+    if args.all_companies and args.action != 'clean':
+        parser.error('--all is only valid with clean')
+    if args.yes and args.action != 'clean':
+        parser.error('--yes is only valid with clean')
+    if args.force and args.action != 'clean':
+        parser.error('--force is only valid with clean')
+    if args.cycles < 1 or args.cycles > 10 or (args.action != 'rebuild' and args.cycles != 1):
+        parser.error('--cycles must be 1..10 and requires rebuild when greater than one')
+    if args.boot_disk_size_gb is not None and not 50 <= args.boot_disk_size_gb <= 1000:
+        parser.error('--boot-disk-size-gb must be between 50 and 1000')
+    if args.action == 'clean':
+        run_clean(args)
+        return
+    if args.action not in ('check', 'clean'):
+        from uncloud_preflight import check_controller
+        if args.action == 'destroy':
+            for command in ['terraform', 'gcloud', 'ssh', 'ssh-keygen']:
+                if not shutil.which(command):
+                    raise ValueError(f'Missing controller prerequisite: {command}')
+        else:
+            # Fail before prompts / Trust when the workstation is missing tools.
+            check_controller(require_google=True, require_terraform=True)
+    interactive = can_prompt(args.non_interactive)
+    if args.action == 'up' and interactive and args.config is None:
+        from uncloud_config import ask, collect
+        def short_company(value):
+            value = company_slug(value)
+            if len(value)>40:
+                raise ValueError('Company slug must be at most 40 characters')
+            if args.action == 'up':
+                require_new_company(value, reject_profile=True)
+            return value
+        company = ask('Company name / environment slug', validate=short_company)
+        company_file = ROOT / 'uncloud' / 'environments' / (company + '.json')
+        config = collect(company, args.machine_type, args.boot_disk_size_gb)
+        if args.deployment:
+            config['deployment'] = args.deployment
+        config['operator_cidrs'] = with_updater([operator_cidr(args.operator_cidr)])
+        private_json(company_file, config)
+        args.config = company_file
+        args.trust_token_from_wizard = True
+        print('Company environment file written: ' + str(company_file.relative_to(ROOT)), flush=True)
+    if args.config is None:
+        args.config = resolve_company_config()
+    if args.config is None:
+        env_dir = ROOT / 'uncloud' / 'environments'
+        available = sorted(p.name for p in env_dir.glob('*.json')) if env_dir.exists() else []
+        hint = (' Available: ' + ', '.join(available)) if available else ''
+        parser.error(
+            'Provide --config uncloud/environments/COMPANY.json for this operation'
+            ' (or keep a single company environment / one in-progress install).'
+            + hint
+            + ' Run ./uncloudctl up in a terminal to create a new company.'
+        )
+    selected_config = json.loads(args.config.read_text())
+    if args.deployment:
+        selected_config['deployment'] = args.deployment
+    if args.action == 'up':
+        if not selected_config.get('company') or selected_config.get('legacy_resource_names'):
+            parser.error('New installations need a named company file. Run ./uncloudctl up in a terminal.')
+        require_new_company(selected_config['company'])
+    if 'company' not in selected_config:
+        selected_config['legacy_resource_names'] = True
+    configure(selected_config)
+    if args.action == 'check':
+        report = check_company_status(args.config)
+        if args.json:
+            print(json.dumps(report, indent=2), flush=True)
+        return
+    needs_trust = args.action != 'destroy' or args.remove_dns or args.remove_trust
+    if needs_trust:
+        from uncloud_support import ensure_certlocker_token
+        # Interactive up always re-prompts unless the fresh wizard already collected it.
+        wizard_token = bool(getattr(args, 'trust_token_from_wizard', False))
+        ensure_certlocker_token(
+            interactive=interactive,
+            always_prompt=interactive and args.action == 'up' and not wizard_token,
+        )
+    os.umask(0o077)
+    os.environ['TF_IN_AUTOMATION'] = '1'
+    os.environ['CLOUDSDK_CORE_DISABLE_PROMPTS'] = '1'
+    # Never inherit Terraform CLI arguments, alternate state directories or var
+    # values that could redirect this bounded workflow to another environment.
+    for name in list(os.environ):
+        if name.startswith(('TF_CLI_ARGS', 'TF_VAR_')) or name in ('TF_DATA_DIR', 'TF_WORKSPACE'):
+            del os.environ[name]
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (STATE / 'workflow.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('Another CertLocker HA lifecycle workflow is already running') from None
+        run_dir = STATE / 'runs' / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8])
+        run_dir.mkdir(parents=True, mode=0o700)
+        workflow = Workflow(args.config, run_dir)
+        workflow.until = args.until
+        workflow.machine_type = args.machine_type or 'e2-standard-2'
+        workflow.boot_disk_size_gb = args.boot_disk_size_gb or selected_config.get('boot_disk_size_gb',100)
+        workflow.interactive_setup = interactive
+        workflow.action = args.action
+        workflow.remove_dns = args.remove_dns
+        workflow.remove_trust = args.remove_trust
+        workflow.skip_failover = args.action in ('up','resume') and not args.test_failover
+        if args.action != 'destroy':
+            workflow.config['operator_cidrs'] = with_updater([operator_cidr(args.operator_cidr)])
+            if args.vpn_cidr:
+                workflow.config['vpn_cidrs'] = with_updater([operator_cidr(value) for value in args.vpn_cidr])
+            else:
+                workflow.config['vpn_cidrs'] = with_updater(workflow.config.get('vpn_cidrs', []))
+        workflow.evidence['verified_through'] = args.until
+        print(f'Workflow evidence: {run_dir}', flush=True)
+        try:
+            workflow.prepare()
+            if args.preflight_only:
+                workflow.evidence.update(status='passed',finished_at=timestamp(),preflight_only=True)
+                workflow.save()
+                print('Company preflight passed; no infrastructure was created or changed.',flush=True)
+                return
+            for index in range(args.cycles):
+                cycle_started = time.monotonic()
+                cycle = {'number': index + 1, 'started_at': timestamp(), 'status': 'running'}
+                workflow.evidence['cycles'].append(cycle)
+                workflow.save()
+                if args.action in ('destroy', 'rebuild'):
+                    # Successful installs clean Cloudflare and Trust on teardown/rebuild.
+                    # Partial ups enroll Trust before active.json exists; without an
+                    # explicit --remove-trust those records would otherwise survive.
+                    has_active = (STATE / 'active.json').exists()
+                    workflow.remove_dns = args.remove_dns or has_active
+                    workflow.remove_trust = args.remove_trust or has_active
+                    if not workflow.remove_trust:
+                        if os.environ.get('CERTLOCKER_TOKEN', '').strip():
+                            workflow.remove_trust = True
+                            print(
+                                'No active installation marker; CERTLOCKER_TOKEN is set so '
+                                'company Trust will still be revoked after infrastructure teardown.',
+                                flush=True,
+                            )
+                        else:
+                            try:
+                                config_rel = workflow.config_path.relative_to(ROOT)
+                            except ValueError:
+                                config_rel = workflow.config_path
+                            print(
+                                'No active installation marker; company Trust was not revoked. '
+                                'A failed/partial up can leave certificate enrollment in Trust even '
+                                'when no VMs remain. To clear it: CERTLOCKER_TOKEN=… '
+                                f'./uncloudctl destroy --config {config_rel} --remove-trust '
+                                '--non-interactive',
+                                flush=True,
+                            )
+                    cycle['destroy'] = workflow.apply(destroy=True)
+                    (STATE / 'active.json').unlink(missing_ok=True)
+                    cycle['destroy_passed'] = True
+                    workflow.save()
+                    if args.action == 'rebuild':
+                        use_company_names_after_destroy(workflow)
+                        # Teardown may have revoked the bootstrap key. Re-enroll
+                        # the same in-memory identity before creating replacement VMs.
+                        workflow.prepare_ssh_identity()
+                if args.action != 'destroy':
+                    workflow.up(cycle)
+                else:
+                    cycle.update(status='passed', finished_at=timestamp())
+                workflow.save()
+                cycle['seconds'] = round(time.monotonic() - cycle_started, 3)
+                workflow.save()
+                print(f"Cycle {index + 1}/{args.cycles}: {cycle['status']}", flush=True)
+            passed = all(cycle['status'] == 'passed' for cycle in workflow.evidence['cycles'])
+            workflow.evidence.update(status='passed' if passed else 'failed', finished_at=timestamp())
+        except BaseException:
+            workflow.evidence.update(status='failed', finished_at=timestamp())
+            if workflow.evidence['cycles']:
+                workflow.evidence['cycles'][-1]['status'] = 'failed'
+                workflow.evidence['cycles'][-1]['seconds'] = round(time.monotonic() - cycle_started, 3)
+            raise
+        finally:
+            try:
+                workflow.evidence['total_seconds'] = round(time.monotonic() - workflow.started_monotonic, 3)
+                workflow.save()
+                workflow.progress.finish(workflow.evidence.get('status', 'failed'))
+            finally:
+                workflow.ssh_keys.close()
+        from uncloud_progress import format_duration
+        print(
+            f"{args.action}: {workflow.evidence['status']}; {args.cycles} cycle(s) completed in "
+            f"{format_duration(workflow.evidence['total_seconds'])}. Evidence: {run_dir / 'result.json'}",
+            flush=True,
+        )
+        if workflow.evidence['status'] != 'passed':
+            raise RuntimeError('Repeated cycles completed with failed acceptance checks; inspect the saved results')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('Workflow interrupted. No automatic cleanup was requested; check the run evidence before further operations.', file=sys.stderr)
+        if Progress.current is not None:
+            Progress.current.finish('stopped')
+        sys.exit(130)
+    except (ValueError, KeyError, OSError, RuntimeError) as error:
+        print(f'Workflow stopped: {error}', file=sys.stderr)
+        if Progress.current is not None:
+            Progress.current.finish('stopped')
+        sys.exit(1)

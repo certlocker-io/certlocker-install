@@ -1,0 +1,72 @@
+---
+- name: Preserve local mesh addresses in host-network Router registrations
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Install the bounded local mesh NAT exception
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/certlocker-uncloud-local-route
+        mode: '0755'
+        content: |
+          #!/usr/bin/python3
+          import ipaddress,json,subprocess,time
+          address='{{ uncloud_mesh_ip }}'
+          assert ipaddress.ip_address(address) in ipaddress.ip_network('10.210.0.0/16')
+          for attempt in range(60):
+              interfaces=json.loads(subprocess.check_output(['ip','-j','-4','address','show']))
+              if any(a['local']==address for interface in interfaces for a in interface['addr_info']):
+                  break
+              time.sleep(1)
+          else:
+              raise RuntimeError('Uncloud host address not available')
+          rule=['-s',address+'/32','-d',address+'/32','-o','lo','-m','comment','--comment','CertLocker local mesh identity','-j','RETURN']
+          base=['iptables','-w','10','-t','nat']
+          if subprocess.run(base+['-C','POSTROUTING']+rule,capture_output=True).returncode:
+              subprocess.run(base+['-I','POSTROUTING','1']+rule,check=True)
+
+    - name: Preserve local registration source addresses now
+      ansible.builtin.command: /usr/local/sbin/certlocker-uncloud-local-route
+      changed_when: false
+
+    - name: Install the local route exception after Docker and Uncloud at boot
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/certlocker-uncloud-local-route.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Preserve local mesh source addresses for CertLocker registrations
+          After=docker.service uncloud.service
+          Wants=docker.service uncloud.service
+          Before=certlocker-uncloud-db.service
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/sbin/certlocker-uncloud-local-route
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable source identity preservation on boot
+      ansible.builtin.systemd_service:
+        name: certlocker-uncloud-local-route.service
+        enabled: true
+        daemon_reload: true
+        state: started
+
+    - name: Verify a real local mesh TCP connection keeps its source address
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import socket
+        address='{{ uncloud_mesh_ip }}'
+        with socket.socket() as listener:
+            listener.settimeout(5)
+            listener.bind((address,0))
+            listener.listen(1)
+            with socket.create_connection(listener.getsockname(),5) as client:
+                connection, peer=listener.accept()
+                connection.close()
+                assert peer[0]==address, 'Local mesh identity was changed by NAT'
+        print('Local mesh source identity verified')
+        PY
+      changed_when: false

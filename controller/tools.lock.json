@@ -1,0 +1,30 @@
+{
+  "uc": {
+    "version": "0.21.0",
+    "url": "https://github.com/psviderski/uncloud/releases/download/v0.21.0/uc_linux_{arch}.tar.gz",
+    "hashes": {
+      "amd64": "11a87551d31144a5837c04d87d4f984c2a62b29052bb3a29d2a5cb72be7de616",
+      "arm64": "f9416a97a409865238e8a7be5ad4a0441cc8523c8f33967a9a87eea27109d47e"
+    }
+  },
+  "gcloud": {
+    "version": "591.0.0",
+    "url": "https://storage.googleapis.com/cloud-sdk-release/google-cloud-cli-591.0.0-{target}.tar.gz",
+    "targets": {
+      "amd64": "linux-x86_64",
+      "arm64": "linux-arm"
+    },
+    "hashes": {
+      "amd64": "78c570f5fcfe58a9311bd98c06b75530595e3cae6277aad75a676a39e6ee7b63",
+      "arm64": "f5e5df0433f77c0e7f5df9fd4bce2e46c7b7967e79cf66e31b1164d3d4c86546"
+    }
+  },
+  "terraform": {
+    "version": "1.16.6",
+    "url": "https://releases.hashicorp.com/terraform/1.16.6/terraform_1.16.6_linux_{arch}.zip",
+    "hashes": {
+      "amd64": "38034b38d03096399a7a1264a14561a8029b2b496fd1f169452656e53968f1b7",
+      "arm64": "a750b5a11038f165846b2658c40c88cd7070aa67a61bab431a14ba27928ea9ea"
+    }
+  }
+}

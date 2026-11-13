@@ -1,0 +1,74 @@
+{
+  "node_type": "DATASERVICE",
+{% if certlocker_dataservice_application_config_source == 'trust' %}
+  "master_key": {
+    "token": {{ certlocker_dataservice_master_key_trust_token | to_json }},
+    "secret": {{ certlocker_dataservice_master_key_trust_secret | to_json }}
+  },
+{% elif certlocker_dataservice_application_config_source == 'resolved' %}
+  "master_key": {{ vault_certlocker_master_key | to_json }},
+{% endif %}
+  "registra_port": 40905,
+  "event_bus_config": {
+    "threads": "5",
+    "repository_location": "${ApplicationRepository:repo}"
+  },
+  "cache_groups": [
+    "SYSTEM",
+    "USER"
+  ],
+  "session_config": {
+    "session_timeout": "24h",
+    "password_reset_timeout": "6h",
+    "session_renew": "5m",
+    "idle_timeout": "30m"
+  },
+  "password_config": {
+    "change_period": "HALF_YEARLY",
+    "minimum_length": 10,
+    "minimum_numerics": 1,
+    "minimum_upper": 1,
+    "minimum_alpha": 1,
+    "minimum_special": 1
+  },
+  "invite_base_url": "${EdgeBaseUrl:http://localhost:5174}",
+  "invite_accept_path": "/accept-invite",
+  "guacd_host": "${GUACD_HOST:{{ certlocker_edge_guacd_host | default('guacd') }}}",
+  "guacd_port": "${GUACD_PORT:{{ certlocker_edge_guacd_port | default(4822) | int }}}",
+  "rdp_security": "${RDP_SECURITY:{{ certlocker_rdp_security | default('nla') }}}",
+  "email_server_config": {
+    "type": "${ProviderType:SMTP}",
+    "smtp_host": "${SmtpHost:smtp.gmail.com}",
+    "smtp_port": "${SmtpPort:587}",
+    "smtp_username": "${SmtpUsername:darren@certlocker.io}",
+    "smtp_password": "${SmtpPassword:}",
+    "smtp_ssl": "${SmtpSsl:false}",
+    "start_tls": {{ '"${SmtpStartTls:true}"' if uncloud_company is defined else 'true' }},
+    "auth": true,
+    "ssl_trust": "",
+    "enabled": "${SmtpEnabled:true}"
+  },
+  "router_client_config": {
+    "url": "${ApplicationRouter:http://localhost:9000}",
+    "registra_address": "${ApplicationRegistra:localhost:40905}",
+    "http_client_config": {
+      "io_threads": 5,
+      "max_connections": 12,
+      "connect_timeout": 2000,
+      "socket_timeout": 300000
+    }
+  },
+  "main": {
+    "dialect": "POSTGRES",
+{% if certlocker_dataservice_jdbc_url is defined %}
+    "jdbc_url": {{ certlocker_dataservice_jdbc_url | to_json }},
+{% endif %}
+    "host": "${POSTGRES:localhost}",
+    "port": "${POSTGRES_PORT:5432}",
+    "username": "postgres",
+    "password": "${POSTGRES_PASSWORD:password}",
+    "instance": "main",
+    "database": "certlocker",
+    "max_pool_size": 10
+  }
+}

@@ -1,0 +1,70 @@
+---
+# Each list item is passed to community.general.ufw — keys must match the module
+# (rule, port, proto, src, dest, interface, comment, route, log, etc.).
+- name: Install UFW
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+    update_cache: false
+
+- name: Disable IPv6 in UFW (IPV6=no)
+  ansible.builtin.lineinfile:
+    path: /etc/default/ufw
+    regexp: '^IPV6='
+    line: 'IPV6=no'
+  when: ufw_managed_disable_ipv6 | default(false) | bool
+  notify: Reload UFW
+
+- name: Apply UFW rules (declarative list in group_vars)
+  community.general.ufw: "{{ item }}"
+  loop: "{{ ufw_managed_rules }}"
+  loop_control:
+    label: "{{ item.comment | default(item.rule | default('allow')) }} {{ item.src | default('') }} {{ item.port | default('') }}"
+
+- name: Set UFW default policies (optional)
+  community.general.ufw:
+    direction: "{{ item.direction }}"
+    policy: "{{ item.policy }}"
+  loop: "{{ ufw_managed_defaults | default([]) }}"
+  when: ufw_managed_defaults | default([]) | length > 0
+
+- name: Enable UFW
+  community.general.ufw:
+    state: enabled
+  when: ufw_managed_enabled | bool
+
+# Legacy: open 7000/8000/9000 from Anywhere — Ansible does not remove UFW rows you drop from YAML; purge by number.
+- name: Remove IPv4 allow rules for 7000/8000/9000 from Anywhere if still present
+  ansible.builtin.shell: |
+    set -u
+    out=
+    for port in 7000 8000 9000; do
+      while ufw status numbered 2>/dev/null | grep -F "${port}/tcp" | grep -vF "(v6)" | grep -qF "Anywhere"; do
+        line=$(ufw status numbered | grep -F "${port}/tcp" | grep -vF "(v6)" | grep -F "Anywhere" | head -1)
+        num=$(echo "$line" | sed -n 's/^\[\([0-9]*\)\].*/\1/p')
+        ufw --force delete "$num"
+        out="${out}x"
+      done
+    done
+    [ -n "$out" ] && echo removed || true
+  when: ufw_managed_cleanup_high_ports_anywhere | default(true) | bool
+  register: ufw_managed_rm_v4_highports
+  changed_when: "'removed' in (ufw_managed_rm_v4_highports.stdout | default(''))"
+
+# Legacy: with IPV6=yes, `ufw allow 7000/tcp` (no from) creates a matching (v6) row; IPV6=no does not remove old user6 rules.
+- name: Remove IPv6 allow rules for 7000/8000/9000 if still present
+  ansible.builtin.shell: |
+    set -u
+    out=
+    for port in 7000 8000 9000; do
+      while ufw status numbered 2>/dev/null | grep -qF "${port}/tcp (v6)"; do
+        line=$(ufw status numbered | grep -F "${port}/tcp (v6)" | head -1)
+        num=$(echo "$line" | sed -n 's/^\[\([0-9]*\)\].*/\1/p')
+        ufw --force delete "$num"
+        out="${out}x"
+      done
+    done
+    [ -n "$out" ] && echo removed || true
+  when: ufw_managed_disable_ipv6 | default(false) | bool
+  register: ufw_managed_rm_v6_highports
+  changed_when: "'removed' in (ufw_managed_rm_v6_highports.stdout | default(''))"

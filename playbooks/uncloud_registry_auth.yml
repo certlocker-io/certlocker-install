@@ -1,0 +1,48 @@
+---
+- name: Configure customer image access using the attached Google VM identity
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Require explicit customer registry and service account
+      ansible.builtin.assert:
+        that:
+          - uncloud_registry_mode == 'gcp'
+          - uncloud_registry_host is match('^[a-z0-9-]+-docker\.pkg\.dev$')
+          - uncloud_registry_service_account is match('^[a-z0-9-]+@[a-z0-9-]+\.iam\.gserviceaccount\.com$')
+
+    - name: Create private configuration directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+      loop: [/etc/certlocker, /root/.docker]
+
+    - name: Install identity-only registry authentication
+      ansible.builtin.copy:
+        src: "ops/files/{{ item }}"
+        dest: "/usr/local/sbin/{{ item }}"
+        mode: '0755'
+      loop: [uncloud_gcp.py, docker-credential-certlocker-gcp]
+
+    - name: Save only non-secret registry identity settings
+      ansible.builtin.copy:
+        dest: /etc/certlocker/gcp-registry.json
+        content: "{{ {'registry_host': uncloud_registry_host, 'registry_prefix': uncloud_registry_prefix, 'service_account': uncloud_registry_service_account} | to_json }}"
+        mode: '0600'
+
+    - name: Configure Docker with a helper and no saved passwords
+      ansible.builtin.copy:
+        dest: /root/.docker/config.json
+        content: "{{ {'credHelpers': {uncloud_registry_host: 'certlocker-gcp'}} | to_json }}"
+        mode: '0600'
+
+    - name: Verify VM identity without printing or caching the token
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - "import json,sys; sys.path.insert(0,'/usr/local/sbin'); from uncloud_gcp import access_token; access_token(json.load(open('/etc/certlocker/gcp-registry.json'))['service_account'])"
+      changed_when: false
+      no_log: true

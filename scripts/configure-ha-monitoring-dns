@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Create DNS-only A records for the VPN-restricted Grafana endpoint."""
+import argparse
+import json
+from pathlib import Path
+import urllib.parse
+
+from uncloud_support import Trust, company_slug, inventory_directory, trust_name
+from uncloud_certificates import cloudflare_preflight
+from uncloud_cloudflare import Cloudflare
+
+
+def configure(api, zone_id, company, hostname, addresses):
+    records_path = 'zones/' + zone_id + '/dns_records'
+    marker = 'CertLocker setup-ha ' + company + ' Grafana '
+    query = urllib.parse.urlencode({'name': hostname, 'per_page': 100, 'page': 1})
+    rows = api.request('GET', records_path + '?' + query)
+    if not isinstance(rows, list) or len(rows) >= 100:
+        raise ValueError('Grafana DNS record lookup is incomplete or exceeds its safe bound')
+    for record in rows:
+        if record.get('type') != 'A' or not str(record.get('comment', '')).startswith(marker):
+            raise ValueError('Grafana DNS name already has records not owned by this setup; reconcile it manually')
+    result = []
+    for node, address in sorted(addresses.items()):
+        comment = marker + node
+        owned = [record for record in rows if record.get('type') == 'A' and record.get('comment') == comment]
+        if len(owned) > 1:
+            raise ValueError('Grafana DNS contains duplicate setup-owned records')
+        desired = {'type': 'A', 'name': hostname, 'content': address, 'ttl': 1,
+                   'proxied': False, 'comment': comment}
+        if owned and all(owned[0].get(key) == value for key, value in desired.items()):
+            result.append(owned[0]['id'])
+            continue
+        if owned:
+            api.request('PATCH', records_path + '/' + owned[0]['id'], desired)
+        else:
+            api.request('POST', records_path, desired)
+        observed = api.request('GET', records_path + '?' + query)
+        match = [record for record in observed if record.get('comment') == comment and
+                 record.get('type') == 'A' and record.get('content') == address and
+                 record.get('proxied') is False]
+        if len(match) != 1:
+            raise RuntimeError('Cloudflare did not confirm the DNS-only Grafana origin record')
+        result.append(match[0]['id'])
+        rows = observed
+    return {'hostname': hostname, 'proxied': False, 'origins': addresses,
+            'records': result, 'vpn_restriction_enforced_by_haproxy': True}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('company')
+    parser.add_argument('--zone', required=True)
+    args = parser.parse_args()
+    company = company_slug(args.company)
+    directory = inventory_directory(company)
+    identity = json.loads((directory / '.setup.json').read_text())
+    installation = json.loads((Path(identity['state_dir']) / 'installation.json').read_text())
+    config = installation['config']
+    inventory = json.loads((directory / 'hosts.json').read_text())
+    addresses = {node: host['ansible_host'] for node, host in
+                 inventory['all']['children']['uncloud']['hosts'].items()}
+    if (identity['company'] != company or installation['company'] != company or
+            sorted(addresses.values()) != sorted(identity['addresses']) or
+            sorted(addresses.values()) != sorted(installation['addresses'])):
+        raise ValueError('Inventory differs from the installation binding')
+    trust = Trust(group=config.get('trust_group') or company, account_id=config.get('trust_account_id'))
+    if config.get('registry_mode') == 'gcp':
+        trust.bind_account(company, config['trust_account_id'], config['trust_account_marker_id'])
+    settings = trust.get(trust_name(company, 'vault_certlocker_ingress_settings'))
+    hostname = settings.get('grafana_hostname') if isinstance(settings, dict) else None
+    if not hostname or not hostname.endswith('.' + args.zone):
+        raise ValueError('Trust Grafana hostname must belong to the selected Cloudflare zone')
+    token, zone_id = cloudflare_preflight(company, trust, args.zone)
+    print(json.dumps(configure(Cloudflare(token), zone_id, company, hostname, addresses), indent=2))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, RuntimeError, OSError, KeyError) as error:
+        raise SystemExit(str(error)) from None

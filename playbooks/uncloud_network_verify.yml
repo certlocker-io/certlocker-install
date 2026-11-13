@@ -1,0 +1,34 @@
+---
+- name: Verify private mesh after hardening
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Verify the peer route uses the WireGuard interface
+      ansible.builtin.command: "ip -j route get {{ hostvars[item].uncloud_mesh_ip }}"
+      loop: "{{ groups['uncloud'] }}"
+      when: item != inventory_hostname
+      register: uncloud_peer_routes
+      changed_when: false
+
+    - name: Require the peer route to traverse the Uncloud interface
+      ansible.builtin.assert:
+        that:
+          - (item.stdout | from_json | first).dev == 'uncloud'
+      loop: "{{ uncloud_peer_routes.results }}"
+      when: not item.skipped | default(false)
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Verify encrypted peer reachability
+      ansible.builtin.command: "ping -c 3 -W 3 {{ hostvars[item].uncloud_mesh_ip }}"
+      loop: "{{ groups['uncloud'] }}"
+      when: item != inventory_hostname
+      changed_when: false
+
+    - name: Report private routes only
+      ansible.builtin.debug:
+        msg: "{{ item.stdout | default('local node') }}"
+      loop: "{{ uncloud_peer_routes.results }}"
+      loop_control:
+        label: "{{ item.item }}"

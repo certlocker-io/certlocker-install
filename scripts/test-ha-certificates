@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""Exercise the released Trust data loader and both HAProxy certificate targets in the disposable lab."""
+import argparse
+from contextlib import ExitStack
+from uncloud_host_access import installation_key
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+
+from uncloud_support import Trust, company_slug, inventory_directory, prepare_ingress, run_ansible, write_private
+from uncloud_certificates import identity, automation_data, rehearsal_data, stable_id, issuance_data, cloudflare_preflight, acme_profile_preflight, schedule_existing_certificate
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def deployment_retry_ids(company, run_id, helper_version=None):
+    # Retain the original retry identity for interrupted older installations.
+    result = [stable_id(company, 'bootstrap-deployment-retry-' + run_id),
+              stable_id(company, 'bootstrap-deployment-retry-2-' + run_id)]
+    if helper_version is not None:
+        if not re.fullmatch(r'[a-f0-9]{64}', helper_version):
+            raise ValueError('Invalid activation helper fingerprint')
+        result.append(stable_id(company, 'bootstrap-helper-retry-' + run_id + helper_version))
+    return result
+
+
+def next_deployment_retry(queue_id, retry_ids, transient):
+    if not transient:
+        return None
+    index = retry_ids.index(queue_id) + 1 if queue_id in retry_ids else 0
+    return retry_ids[index] if index < len(retry_ids) else None
+
+
+def console_shows_helper_activation(console):
+    """True only for real activate-helper stdout, not Trust audit template text."""
+    if not console:
+        return False
+    return bool(re.search(
+        r'Certificate activated; both UI names verified|'
+        r'Certificate already active; both UI names verified',
+        console))
+
+
+def console_transport_retryable(console):
+    if not console:
+        return False
+    return bool(re.search(
+        r'timed out|EOF|connection reset|temporarily unavailable|protocol error|corrupt packet',
+        console, re.I))
+
+
+def require_retry_within_deadline(workflow, remaining_seconds, now=None):
+    """Surface a provider deferral immediately instead of an opaque 15-minute wait."""
+    if workflow.get('cert_id') or not workflow.get('retry_after'):
+        return
+    try:
+        retry = datetime.fromisoformat(workflow['retry_after'].replace('Z', '+00:00'))
+        if retry.tzinfo is None:
+            retry = retry.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError, AttributeError):
+        raise ValueError('Certificate workflow contains an invalid retry time') from None
+    now = datetime.now(timezone.utc).timestamp() if now is None else now
+    if retry.timestamp() > now + remaining_seconds:
+        raise RuntimeError('Certificate authority deferred this order until ' +
+                           retry.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC') +
+                           '. The existing bootstrap workflow is retained; resume after that time.')
+
+
+def verify_public_origin(address, hostnames, fingerprint):
+    for hostname in hostnames:
+        with socket.create_connection((address, 443), timeout=10) as plain:
+            with ssl.create_default_context().wrap_socket(plain, server_hostname=hostname) as connection:
+                if hashlib.sha256(connection.getpeercert(binary_form=True)).hexdigest() != fingerprint:
+                    raise RuntimeError('Public origin serves a different certificate')
+                connection.sendall(('GET /health/ready HTTP/1.1\r\nHost: ' + hostname +
+                                    '\r\nConnection: close\r\n\r\n').encode())
+                if not connection.recv(4096).split(b'\r\n', 1)[0].startswith(b'HTTP/1.1 200'):
+                    raise RuntimeError('Public origin failed readiness after automation')
+
+
+def main(argv=None):
+    with ExitStack() as key_access:
+        return run_main(argv, key_access)
+
+
+def run_main(argv, key_access):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('company', type=company_slug)
+    parser.add_argument('--reject-invalid', action='store_true',
+                        help='Prove invalid bundles are rejected while both existing public origins stay healthy')
+    parser.add_argument('--issue-new', action='store_true', help='Request the lab wildcard through real ACME DNS-01 and deploy it through Trust')
+    parser.add_argument('--reuse-issued', action='store_true', help='Explicitly import a valid company Trust certificate, deploy it and schedule renewal without a new order')
+    parser.add_argument('--acme-email', help='ACME registration email for a new certificate order')
+    parser.add_argument('--dns-zone', required=True)
+    parser.add_argument('--ensure', action='store_true', help='Resume the one bootstrap order for this installation instead of creating another')
+    args = parser.parse_args(argv)
+    bootstrap = args.issue_new or args.reuse_issued
+    if args.issue_new and args.reuse_issued:
+        parser.error('Choose new issuance or existing-certificate reuse')
+    if bootstrap and (not args.acme_email or args.reject_invalid):
+        parser.error('Certificate bootstrap requires --acme-email and cannot be combined with --reject-invalid')
+    if args.reuse_issued and not args.ensure:
+        parser.error('--reuse-issued requires --ensure to retain the same import and renewal identities')
+    if not (bootstrap and args.ensure):
+        parser.error('Only resumed customer certificate bootstrap is supported')
+    if not (bootstrap or args.reject_invalid):
+        parser.error('Choose --issue-new, --reuse-issued or --reject-invalid')
+    company = args.company
+    directory = inventory_directory(company)
+    marker = json.loads((directory / '.setup.json').read_text())
+    marker['ssh_key_path'] = key_access.enter_context(installation_key(args.company, directory, marker))
+    if args.reuse_issued:
+        installation = json.loads((Path(marker['state_dir']) / 'installation.json').read_text())
+        from uncloud_support import require_deployment
+        require_deployment(installation['config'])
+    inventory = json.loads((directory / 'hosts.json').read_text())['all']['children']['uncloud']
+    loader = importlib.machinery.SourceFileLoader('certificate_setup', str(ROOT / 'scripts/setup-ha'))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    setup = importlib.util.module_from_spec(spec)
+    loader.exec_module(setup)
+    setup.prepare_ssh(Path(marker['state_dir']))
+    hosts = inventory['hosts']
+    user = inventory['vars']['ansible_user']
+    for name, host in hosts.items():
+        if setup.ssh(marker['ssh_key_path'], host['ansible_host'], 'hostname -s', user=user).strip() != host.get('uncloud_expected_hostname', name):
+            raise ValueError('Connected server identity differs from the saved installation inventory')
+
+    def database(query):
+        # SQL contains only bounded identities and metadata, never credentials.
+        inner = 'export PGPASSWORD="$(cat /run/lab-secrets/postgres)" PGSSLMODE=require; exec psql -h 127.0.0.1 -U postgres -d certlocker -At -v ON_ERROR_STOP=1'
+        remote = shlex.join(['sudo', '-n', 'docker', 'exec', '-i', 'certlocker-uncloud-postgres', 'bash', '-ec', inner])
+        result = subprocess.run(['ssh', '-i', marker['ssh_key_path'], '-o', 'BatchMode=yes',
+                                 user + '@' + hosts[sorted(hosts)[0]]['ansible_host'], remote],
+                                input=query, capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise RuntimeError('Lab database verification failed; output suppressed')
+        return json.loads(result.stdout)
+
+    from uncloud_support import trust_name
+    group = inventory['vars'].get('uncloud_trust_group', company)
+    trust = Trust(group=group, account_id=inventory['vars'].get('uncloud_trust_account_id'))
+    if inventory['vars'].get('uncloud_registry_mode') == 'gcp':
+        trust.bind_account(company, inventory['vars'].get('uncloud_trust_account_id'),
+                           inventory['vars'].get('uncloud_trust_account_marker_id'))
+    account_email = trust.get(trust_name(company, 'vault_certlocker_initial_admin_email'))
+    if not isinstance(account_email, str) or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', account_email):
+        raise ValueError('The saved company superuser email is required for certificate deployment')
+    email_literal = account_email.replace("'", "''")
+    account = database("SELECT json_agg(json_build_object('account_id',a.id,'owner_id',a.accountowner,"
+                       "'user_id',u.id,'status',a.status,'user_status',u.status,'role_ids',u.roleids)) "
+                       "FROM jeremy.users u JOIN jeremy.accounts a ON a.id=u.accountid "
+                       "WHERE a.status='ACTIVE' AND u.status='ACTIVE' AND u.nodetype='EDGE' AND lower(u.email)=lower('" + email_literal + "');")
+    if not isinstance(account, list) or len(account) != 1 or not account[0].get('owner_id') or \
+            'SUPER_USER_FE' not in (account[0].get('role_ids') or []):
+        raise ValueError('The registered company superuser is missing, inactive, or outside its account; refusing to seed certificate assets')
+    account = account[0]
+    material = identity(company, trust)
+    values = prepare_ingress(company, trust, allow_create=False, certificate=not args.issue_new)
+    run_id = uuid.uuid4().hex
+    queued_at = time.time()
+    receipt = Path(marker['state_dir']) / 'certificate-bootstrap-order.json'
+    order_reused = False
+    if args.ensure:
+        if receipt.exists():
+            order_reused = True
+            saved = json.loads(receipt.read_text())
+            if args.issue_new and saved.get('reuse_fingerprint_sha256'):
+                raise ValueError('This lab bootstrap uses an imported certificate; retain explicit reuse mode on resume')
+            if saved['company'] != company or saved['dns_zone'] != args.dns_zone or saved['email'] != args.acme_email:
+                raise ValueError('Existing certificate bootstrap order belongs to different settings')
+            run_id, queued_at = saved['run_id'], saved['queued_at']
+            if not re.fullmatch(r'[a-f0-9]{32}', run_id) or not isinstance(queued_at, (int, float)) or queued_at <= 0:
+                raise ValueError('Invalid saved certificate bootstrap order')
+        else:
+            write_private(receipt, json.dumps({'company': company, 'dns_zone': args.dns_zone,
+                                               'email': args.acme_email, 'run_id': run_id, 'queued_at': queued_at}))
+    data = automation_data(company, group, account['account_id'], account['user_id'],
+                           {name: host['uncloud_mesh_ip'] for name, host in hosts.items()}, material)
+    if bootstrap:
+        cloudflare_token, zone_id = cloudflare_preflight(company, trust, args.dns_zone)
+        settings = {'mode': 'customer', 'email': args.acme_email,
+                    'domains': ['*.' + args.dns_zone], 'zone_id': zone_id,
+                    'profile': 'shortlived',
+                    'acme_directory': 'https://acme-v02.api.letsencrypt.org/directory'}
+        acme_profile_preflight(settings['acme_directory'], settings['profile'])
+        issued = issuance_data(company, group, account['account_id'], account['user_id'],
+                               material, settings, cloudflare_token, cycle=run_id)
+        data.update({key: rows for key, rows in issued.items() if key != 'acme_workflow'})
+        print('Company Cloudflare DNS access verified for wildcard *.' + args.dns_zone, flush=True)
+    if not args.issue_new:
+        rehearsal = rehearsal_data(company, group, account['account_id'], account['user_id'], values['uncloud_ingress_pem'], run_id)
+        data['certs'] = rehearsal['certs']
+        if args.reuse_issued:
+            # Validate validity/profile before importing any certificate assets.
+            renewal_workflow = schedule_existing_certificate(issued, rehearsal['certs'][0])
+            data['certs'][0]['name'] = company + ' imported UI certificate'
+            saved = json.loads(receipt.read_text())
+            fingerprint = rehearsal['certs'][0]['fingerprint_sha256']
+            if saved.get('reuse_fingerprint_sha256', fingerprint) != fingerprint:
+                raise ValueError('The pinned lab certificate source changed; reconcile the existing import before retrying')
+            saved['reuse_fingerprint_sha256'] = fingerprint
+            write_private(receipt, json.dumps(saved))
+            print('Reuse the issued company certificate; no new ACME order will be submitted.', flush=True)
+
+    def load(tables):
+        run_ansible(['ansible-playbook', '-i', directory / 'hosts.json', ROOT / 'playbooks/uncloud_certificate_seed.yml',
+                     '--private-key', marker['ssh_key_path'], '-e', json.dumps({'ansible_remote_tmp': '/run/certlocker-' + company + '-ansible'})],
+                    {'uncloud_certificate_seed': tables})
+
+    print('Load company-scoped assets through the released append-only loader', flush=True)
+    load(data)
+    if args.reject_invalid:
+        names = [values['uncloud_ingress_settings']['hostname'],
+                 values['uncloud_ingress_settings']['backoffice_hostname']]
+        expected = rehearsal['certs'][0]['fingerprint_sha256']
+        for host in hosts.values():
+            verify_public_origin(host['ansible_host'], names, expected)
+            inbox = '/run/certlocker-certificate-inbox/' + company + '/incoming.pem'
+            record = '/run/certlocker/' + company + '/certificate-result.json'
+            probe = ('set -e; sudo -n install -o cl-cert-deploy -g cl-cert-deploy -m 0600 /dev/stdin ' +
+                     shlex.quote(inbox) + '; if sudo -n -u cl-cert-deploy sudo -n ' +
+                     '/usr/local/sbin/certlocker-certificate-activate --company ' + shlex.quote(company) +
+                     '; then exit 42; fi; sudo -n test ! -e ' + shlex.quote(inbox) +
+                     '; sudo -n test ! -e ' + shlex.quote(record))
+            result = subprocess.run(['ssh', '-i', marker['ssh_key_path'], '-o', 'BatchMode=yes',
+                                     user + '@' + host['ansible_host'], probe],
+                                    input='Deliberately invalid lab certificate fixture\n',
+                                    text=True, capture_output=True, timeout=30)
+            if result.returncode:
+                raise RuntimeError('Invalid-bundle rejection or transient-file cleanup failed')
+            verify_public_origin(host['ansible_host'], names, expected)
+        print('Both origins rejected the invalid bundle and retained verified public HTTPS', flush=True)
+    automation_id = stable_id(company, 'certificate-automation')
+    helper_version = hashlib.sha256((ROOT / 'playbooks/ops/files/uncloud_certificate_activate.py').read_bytes()).hexdigest()
+    retry_ids = deployment_retry_ids(company, run_id, helper_version)
+    if args.issue_new:
+        print('Submit real ACME workflow after verifying all prerequisite assets', flush=True)
+        load({'acme_workflow': issued['acme_workflow']})
+        workflow_id = issued['acme_workflow'][0]['id']
+        deadline = time.monotonic() + 900
+        previous_state = None
+        while time.monotonic() < deadline:
+            workflow = database("SELECT json_build_object('status',status,'state',state,'has_error',haserror,'cert_id',certid,'retry_after',retryafter) FROM jeremy.acme_workflow WHERE id='" + workflow_id + "';")
+            state = (workflow['status'], workflow['state'])
+            if state != previous_state:
+                print('ACME workflow:', *state, flush=True)
+                previous_state = state
+            if workflow['has_error']:
+                raise RuntimeError('ACME workflow reported an error; inspect sanitized lab diagnostics')
+            require_retry_within_deadline(workflow, deadline - time.monotonic())
+            cert_id = workflow.get('cert_id')
+            if cert_id:
+                if not re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', cert_id):
+                    raise ValueError('Unexpected issued certificate identity')
+                certificate = database("SELECT json_build_object('fingerprint_sha256',fingerprintsha256,'primary_domain',primarydomain,'expires',expires,'validity_hours',extract(epoch from (expires-notbefore))/3600) FROM jeremy.certs WHERE id='" + cert_id + "';")
+                if not 159 <= float(certificate['validity_hours']) <= 161:
+                    raise RuntimeError('Issued certificate does not have the requested shortlived lifetime')
+                queues = database("SELECT coalesce(json_agg(id ORDER BY datecreated,id),'[]'::json) FROM jeremy.acme_automation_queue WHERE certid='" + cert_id + "' AND automationid='" + automation_id + "';")
+                if queues:
+                    queue_id = queues[0]
+                    for retry_id in retry_ids:
+                        if retry_id in queues:
+                            queue_id = retry_id
+                    if len(set(queues) - set(retry_ids)) != 1:
+                        raise RuntimeError('Unexpected concurrent certificate deployment queues')
+                    expected = certificate['fingerprint_sha256'].replace(':', '').lower()
+                    break
+            time.sleep(5)
+        else:
+            raise RuntimeError('Real ACME issuance did not complete within the lab deadline')
+    else:
+        if args.reuse_issued:
+            workflow_id = renewal_workflow['id']
+            existing = database("SELECT coalesce((SELECT json_build_object('state',state,'scheduled',scheduled,'retry_after',retryafter,'profile',profile,'auto_renew',autorenew) FROM jeremy.acme_workflow WHERE id='" + workflow_id + "'),'null'::json);")
+            if not existing:
+                load({'acme_workflow': [renewal_workflow]})
+            # A rate-limited existing order is retained, not replaced or reset.
+            # Its future retry will deploy through this same automation.
+        print('Queue the existing issued certificate for deployment through Trust automation', flush=True)
+        load({'acme_automation_queue': rehearsal['acme_automation_queue']})
+        queue_id = rehearsal['acme_automation_queue'][0]['id']
+        expected = rehearsal['certs'][0]['fingerprint_sha256']
+        if args.reuse_issued:
+            cert_id = rehearsal['certs'][0]['id']
+            for retry_id in retry_ids:
+                if database("SELECT count(*) FROM jeremy.acme_automation_queue WHERE id='" + retry_id + "';"):
+                    queue_id = retry_id
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        status = database("SELECT json_build_object('queue_status',q.status,'success',a.lastrunsuccess,"
+                          "'activated',coalesce(a.console ~* "
+                          "'Certificate activated; both UI names verified|"
+                          "Certificate already active; both UI names verified',false),"
+                          "'retryable',coalesce(a.console ~* '(timed out|EOF|connection reset|temporarily unavailable|protocol error|corrupt packet)',false)) "
+                          "FROM jeremy.acme_automation_queue q JOIN jeremy.acme_automations a ON a.id=q.automationid WHERE q.id='" + queue_id + "';")
+        if status['queue_status'] == 'COMPLETED':
+            # Trust can mark failure after a live activation when the SSH session
+            # drops on the way out. Only the helper's real stdout counts as
+            # activated — never the audit template text alone.
+            if status['success'] is True or status.get('activated') is True:
+                break
+            retry_id = next_deployment_retry(queue_id, retry_ids, status['retryable'])
+            if bootstrap and args.ensure and retry_id:
+                # Two transient retries plus one recovery per installed helper version, with stable IDs
+                # across resumes. Never retry issuance or a permanent error.
+                stamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec='milliseconds')
+                retry = {'id': retry_id, 'account_id': account['account_id'],
+                         'automation_id': automation_id, 'cert_id': cert_id,
+                         'type': 'CERTIFICATE', 'status': 'PENDING',
+                         'date_created': stamp, 'date_updated': stamp}
+                print('Retry transient certificate deployment (' + str(retry_ids.index(retry_id) + 1) +
+                      '/' + str(len(retry_ids)) + ') using the existing issued certificate.', flush=True)
+                load({'acme_automation_queue': [retry]})
+                queue_id = retry_id
+                deadline = time.monotonic() + 180
+                continue
+            raise RuntimeError('Trust certificate automation reported failure; inspect its private console')
+        time.sleep(3)
+    else:
+        raise RuntimeError('Trust certificate automation did not complete within its lab deadline')
+    evidence = {'schema_version': 1, 'company': company, 'new_certificate_issuance': args.issue_new,
+                'existing_certificate_reused': args.reuse_issued,
+                'certificate_deployment': 'passed', 'automation_id': automation_id,
+                'deployment_queue_id': queue_id, 'bootstrap_order_reused': order_reused,
+                'deployment_retries_used': retry_ids.index(queue_id) + 1 if queue_id in retry_ids else 0,
+                'deployment_retried': bool(bootstrap and queue_id in retry_ids), 'origins': {}}
+    if args.issue_new:
+        renewal = database("SELECT coalesce(json_agg(json_build_object('scheduled',scheduled,'profile',profile,'auto_renew',autorenew,'before_expiry',scheduled < (SELECT expires FROM jeremy.certs WHERE id='" + cert_id + "'))),'[]'::json) FROM jeremy.acme_workflow WHERE certid='" + cert_id + "' AND state='ORDER_SCHEDULED';")
+        if len(renewal) != 1 or not renewal[0]['auto_renew'] or renewal[0]['profile'] != 'shortlived' or not renewal[0]['before_expiry']:
+            raise RuntimeError('Automatic shortlived renewal was not scheduled before certificate expiry')
+        evidence.update({'workflow_id': workflow_id, 'certificate_id': cert_id,
+                         'domains': settings['domains'], 'acme_profile': settings['profile'], 'certificate': certificate,
+                         'renewal': renewal[0]})
+    elif args.reuse_issued:
+        renewal = database("SELECT json_build_object('state',state,'scheduled',coalesce(retryafter,scheduled),'profile',profile,'auto_renew',autorenew) FROM jeremy.acme_workflow WHERE id='" + workflow_id + "';")
+        expires = datetime.fromisoformat(rehearsal['certs'][0]['expires'])
+        if (not renewal or renewal['state'] not in ('ORDER_SCHEDULED', 'ORDER_PENDING') or
+                renewal['profile'] != 'shortlived' or renewal['auto_renew'] is not True or
+                not datetime.now(timezone.utc).replace(tzinfo=None) < datetime.fromisoformat(renewal['scheduled']) < expires):
+            raise RuntimeError('Imported certificate does not have a future renewal or retained retry before expiry')
+        renewal['before_expiry'] = True
+        evidence.update(workflow_id=workflow_id, certificate_id=rehearsal['certs'][0]['id'],
+                        acme_profile='shortlived', renewal=renewal,
+                        certificate={'expires':rehearsal['certs'][0]['expires'],
+                                     'fingerprint_sha256':rehearsal['certs'][0]['fingerprint_sha256']})
+    if args.reject_invalid:
+        evidence['invalid_bundle_rejected_and_existing_https_verified'] = 'passed'
+    for name, host in hosts.items():
+        result = json.loads(setup.ssh(marker['ssh_key_path'], host['ansible_host'],
+                            'sudo -n cat /run/certlocker/' + company + '/certificate-result.json', user=user))
+        if result.get('success') is not True or result.get('company') != company:
+            raise RuntimeError('Origin certificate activation was not verified')
+        if max(result.get('activated_at', 0), result.get('verified_at', 0)) < queued_at - 5:
+            raise RuntimeError('Origin activation report predates this automation run')
+        if result.get('fingerprint_sha256') != expected:
+            raise RuntimeError('Origin activated a different certificate')
+        verify_public_origin(host['ansible_host'], result['hostnames'], expected)
+        result['public_origin_tls_and_readiness'] = 'passed'
+        evidence['origins'][name] = result
+    report = Path(marker['state_dir']) / ('certificate-rehearsal-' + run_id + '.json')
+    write_private(report, json.dumps(evidence, indent=2) + '\n')
+    if args.ensure:
+        write_private(Path(marker['state_dir']) / 'certificate-bootstrap.json', json.dumps(evidence, indent=2) + '\n')
+    print('Trust automation deployed and verified the issued certificate on both HAProxies.', flush=True)
+    print('Sanitized report:', report, flush=True)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        import traceback
+        location = traceback.extract_tb(error.__traceback__)[-1]
+        print('Certificate rehearsal stopped:', type(error).__name__,
+              Path(location.filename).name + ':' + str(location.lineno), file=sys.stderr)
+        if isinstance(error, (ValueError, RuntimeError)):
+            print(str(error), file=sys.stderr)
+        elif isinstance(error, subprocess.CalledProcessError):
+            # setup.ssh uses check=True; missing activation receipts become this.
+            detail = (error.stderr or error.stdout or '').strip()
+            print('Remote verification command failed'
+                  + ((': ' + detail.splitlines()[-1][:200]) if detail else ''),
+                  file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,43 @@
+{
+  "company": "example",
+  "deployment": "prod",
+  "google_project": "REPLACE-google-project",
+  "ssh_user": "ucdeploy",
+  "ssh_private_key": "~/.ssh/certlocker-example",
+  "nodes": {
+    "example-a": {
+      "zone": "europe-west1-b",
+      "machine_type": "e2-standard-2"
+    },
+    "example-b": {
+      "zone": "europe-west4-a",
+      "machine_type": "e2-standard-2"
+    }
+  },
+  "boot_disk_size_gb": 100,
+  "operator_cidrs": [
+    "198.51.100.10/32"
+  ],
+  "vpn_cidrs": [],
+  "trust_group": "REPLACE-company-group",
+  "registry_mode": "ghcr",
+  "runtime_backend": "host",
+  "certificate_mode": "customer",
+  "dns_zone": "example.com",
+  "acme_email": "admin@example.com",
+  "front_url": "https://certlocker.example.com",
+  "backoffice_url": "https://backoffice.example.com",
+  "grafana_url": "https://grafana-cl-example.example.com",
+  "initial_admin_email": "admin@example.com",
+  "account_domain": "example.com",
+  "admin_display_name": "Company administrator",
+  "smtp_mode": "customer",
+  "smtp_host": "smtp.example.com",
+  "smtp_user": "certlocker@example.com",
+  "smtp_port": 587,
+  "smtp_tls": "starttls",
+  "cloudflare_load_balancing": true,
+  "cloudflare_monitor_interval": 60,
+  "http_rate_limit": 400,
+  "store_ssh_key": true
+}

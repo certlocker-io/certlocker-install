@@ -1,0 +1,68 @@
+---
+- name: Install private stable Router endpoints before application startup
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    proxy_root: '/opt/certlocker/{{ uncloud_company }}/uncloud-router-proxy'
+  tasks:
+    - name: Install the private Router selector
+      ansible.builtin.copy:
+        src: ops/files/uncloud_router_proxy.py
+        dest: /usr/local/sbin/certlocker-uncloud-router-proxy
+        mode: '0755'
+    - name: Create private proxy directories
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: directory
+        mode: '0700'
+      loop:
+        - '{{ proxy_root }}'
+        - '/run/certlocker/{{ uncloud_company }}/router-proxy'
+    - name: Configure the initial target and preserve later elections on repeat setup
+      ansible.builtin.command:
+        argv:
+          - /usr/local/sbin/certlocker-uncloud-router-proxy
+          - bootstrap
+          - --company
+          - '{{ uncloud_company }}'
+          - --node-a
+          - '{{ hostvars[groups["uncloud"][0]].uncloud_mesh_ip }}'
+          - --node-a-name
+          - '{{ groups["uncloud"][0] }}'
+          - --node-b
+          - '{{ hostvars[groups["uncloud"][1]].uncloud_mesh_ip }}'
+          - --node-b-name
+          - '{{ groups["uncloud"][1] }}'
+          - --target
+          - '{{ uncloud_router_bootstrap_target | default(hostvars[groups["uncloud"][0]].uncloud_mesh_ip) }}'
+      register: proxy_configuration
+      changed_when: (proxy_configuration.stdout | from_json).changed
+    - name: Render the private proxy service
+      ansible.builtin.template:
+        src: ../uncloud/router-proxy/compose.yaml.j2
+        dest: '{{ proxy_root }}/compose.yaml'
+        mode: '0600'
+    - name: Hold registration sockets while the elected Router starts
+      ansible.builtin.copy:
+        src: ../uncloud/router-proxy/wait-for-router.lua
+        dest: '{{ proxy_root }}/config/wait-for-router.lua'
+        mode: '0600'
+      register: proxy_registration_queue
+    - name: Pull the pinned proxy image
+      ansible.builtin.command:
+        cmd: docker compose pull --quiet
+        chdir: '{{ proxy_root }}'
+      changed_when: false
+    - name: Validate the proxy configuration
+      ansible.builtin.command:
+        cmd: docker compose run --rm --no-deps router-proxy haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+        chdir: '{{ proxy_root }}'
+      changed_when: false
+    - name: Start only loopback listeners
+      ansible.builtin.command:
+        cmd: >-
+          docker compose up -d --wait --wait-timeout 60
+          {{ '--force-recreate' if proxy_configuration.changed or proxy_registration_queue.changed else '' }}
+        chdir: '{{ proxy_root }}'

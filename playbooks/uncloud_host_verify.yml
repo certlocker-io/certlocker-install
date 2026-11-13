@@ -1,0 +1,49 @@
+---
+- name: Verify hardening before installing the Uncloud network or databases
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Verify services and security controls without changing the host
+      ansible.builtin.shell: |
+        set -eu
+        systemctl is-active docker fail2ban
+        systemctl is-enabled docker fail2ban
+        fail2ban-client status sshd
+        ufw status verbose
+        ufw status | grep -q '^Status: active'
+        ufw status verbose | grep -Fqx 'Default: deny (incoming), allow (outgoing), deny (routed)'
+        {% if uncloud_with_apps | default(false) | bool %}
+        if ufw status verbose | grep 'Anywhere' | grep -Ev '^(80|443)/tcp([[:space:]]+\(v6\))?[[:space:]]+ALLOW IN[[:space:]]+Anywhere([[:space:]]+\(v6\))?([[:space:]]+#.*)?[[:space:]]*$'; then exit 1; fi
+        {% else %}
+        if ufw status | grep -q 'Anywhere'; then exit 1; fi
+        {% endif %}
+        sshd -T | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|pubkeyauthentication|maxauthtries|x11forwarding) '
+        sshd -T | grep -qx 'passwordauthentication no'
+        sshd -T | grep -qx 'kbdinteractiveauthentication no'
+        sshd -T | grep -qx 'permitrootlogin no'
+        sshd -T | grep -qx 'pubkeyauthentication yes'
+        sshd -T | grep -qx 'maxauthtries 3'
+        sshd -T | grep -qx 'x11forwarding no'
+        docker version --format '{{ '{{' }}.Server.Version{{ '}}' }}'
+        docker compose version
+        docker buildx version
+        test "$(docker info --format '{{ '{{' }}.LoggingDriver{{ '}}' }}')" = local
+        systemctl is-enabled certlocker-docker-prune.timer
+        grep -q 'rotate 14' /etc/logrotate.d/certlocker-cowrie
+        java -version
+      args:
+        executable: /bin/bash
+      changed_when: false
+      register: uncloud_hardening_result
+
+    - name: Show host verification results
+      ansible.builtin.debug:
+        var: uncloud_hardening_result.stdout_lines
+
+    - name: Require a fresh SSH connection after the hardening changes
+      ansible.builtin.meta: reset_connection
+
+    - name: Verify new SSH connection
+      ansible.builtin.wait_for_connection:
+        timeout: 60

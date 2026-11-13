@@ -1,0 +1,7 @@
+---
+docker_state: started
+docker_enabled: true
+docker_install_compose_plugin: true
+docker_users: []
+# Docker daemon DNS for image pulls. Empty preserves daemon defaults.
+docker_daemon_dns_servers: []

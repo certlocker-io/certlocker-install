@@ -1,0 +1,125 @@
+name: certlocker-{{ uncloud_company }}-apps
+x-java: &java
+  network_mode: host
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  restart: unless-stopped
+  mem_limit: 3g
+  logging:
+    driver: local
+    options: {max-size: '20m', max-file: '5'}
+services:
+{% set ports = {'router': 9000, 'dataservice': 8200, 'gateway': 8300, 'bastion-server': 8400, 'edge': 8500, 'backoffice-api': 8600} %}
+{% for service, port in ports.items() %}
+  {{ service }}:
+    <<: *java
+{% if service == 'router' %}
+    profiles: [ha-primary]
+{% endif %}
+{% if service in ['edge', 'backoffice-api'] and uncloud_api_single_owner | default(true) | bool %}
+    profiles: [owned-api]
+    restart: 'no'
+{% endif %}
+    image: {{ uncloud_release_manifest.services[service].image }}
+    container_name: certlocker-{{ service }}
+    hostname: certlocker-{{ inventory_hostname }}
+    extra_hosts:
+      - 'certlocker-{{ inventory_hostname }}:{{ uncloud_mesh_ip }}'
+    entrypoint:
+      - /bin/bash
+      - -ec
+      - |
+        export CL_INTERNAL_SERVICE_KEY="$$(cat /run/secrets/internal-service-key)"
+{% if service == 'dataservice' %}
+        export POSTGRES_PASSWORD="$$(cat /run/secrets/postgres)"
+        export SmtpPassword="$$(cat /run/secrets/smtp)"
+{% endif %}
+        exec /app/run.sh
+    environment:
+      PORT: '{{ port }}'
+      HOST: '{{ uncloud_mesh_ip }}'
+{% if service == 'router' %}
+      APPLICATION_ROUTER: http://${HA_ROUTER_IP:?HA Router address required}:9000
+      ApplicationRegistra: ${HA_ROUTER_IP:?HA Router address required}:40905
+{% else %}
+      APPLICATION_ROUTER: http://127.0.0.1:19000
+      ApplicationRegistra: 127.0.0.1:41905
+{% endif %}
+      CORS_HEADERS: Authorization,Content-Type,Accept
+      POSTGRES: 127.0.0.1
+      EdgeBaseUrl: {{ vault_certlocker_application_settings.public_url | to_json }}
+      SmtpHost: {{ vault_certlocker_application_settings.smtp_host | to_json }}
+      SmtpUsername: {{ vault_certlocker_application_settings.smtp_user | replace('$', '$$') | to_json }}
+      SmtpEnabled: '{{ vault_certlocker_application_settings.smtp_enabled | bool | lower }}'
+      BASTION_HOST: '{{ uncloud_mesh_ip }}'
+      BASTION_PORT: '2222'
+      GUACD_HOST: '{{ uncloud_mesh_ip }}'
+      GUACD_PORT: '4822'
+      RDP_SECURITY: nla
+{% if service == 'dataservice' %}
+      APPLICATION_CONFIG: /app/config/application.json
+      SmtpPort: '{{ vault_certlocker_application_settings.smtp_port | default(587) }}'
+      SmtpSsl: '{{ (vault_certlocker_application_settings.smtp_tls | default("starttls") == "tls") | lower }}'
+      SmtpStartTls: '{{ (vault_certlocker_application_settings.smtp_tls | default("starttls") == "starttls") | lower }}'
+{% endif %}
+{% if service == 'backoffice-api' %}
+      APPLICATION_CONFIG: /app/config/application.json
+{% endif %}
+    volumes:
+      - /run/certlocker/{{ uncloud_company }}/internal-service-key:/run/secrets/internal-service-key:ro
+{% if service == 'dataservice' %}
+      - /run/certlocker/{{ uncloud_company }}/dataservice.application.json:/app/config/application.json:ro
+      - /run/certlocker/{{ uncloud_company }}/postgres:/run/secrets/postgres:ro
+      - /run/certlocker/{{ uncloud_company }}/smtp:/run/secrets/smtp:ro
+{% endif %}
+{% if service == 'backoffice-api' %}
+      - ./backoffice.application.json:/app/config/application.json:ro
+{% endif %}
+    healthcheck:
+      test: [CMD-SHELL, "timeout 2 bash -c '</dev/tcp/{{ uncloud_mesh_ip }}/{{ port }}'"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
+{% endfor %}
+  guacd:
+    image: guacamole/guacd:1.6.0
+    container_name: certlocker-guacd
+    network_mode: host
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    mem_limit: 256m
+    healthcheck:
+      test: [CMD-SHELL, 'nc -z 127.0.0.1 4822']
+      interval: 10s
+      timeout: 3s
+      retries: 12
+{% for service, port, backend in [('ui', 3080, 'edge'), ('backoffice-ui', 3081, 'backoffice-api')] %}
+  {{ service }}:
+    image: {{ uncloud_release_manifest.services[service].image }}
+    container_name: certlocker-{{ service }}
+    ports: ['127.0.0.1:{{ port }}:80', '{{ uncloud_mesh_ip }}:{{ port }}:80']
+    networks: [uncloud]
+    extra_hosts:
+      - 'edge:{{ uncloud_mesh_ip }}'
+      - 'gateway:{{ uncloud_mesh_ip }}'
+      - 'backoffice-api:{{ uncloud_mesh_ip }}'
+    volumes: ['./{{ service }}.nginx.conf:/etc/nginx/conf.d/default.conf:ro']
+    environment:
+      NGINX_ENTRYPOINT_QUIET_LOGS: '1'
+      CERTLOCKER_UI_RUNTIME_TAG: '{{ uncloud_release_manifest.services[service].version }}'
+      CERTLOCKER_BO_RUNTIME_TAG: '{{ uncloud_release_manifest.services[service].version }}'
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    mem_limit: 256m
+    healthcheck:
+      test: [CMD-SHELL, 'nginx -t >/dev/null 2>&1']
+      interval: 10s
+      timeout: 3s
+      retries: 12
+{% endfor %}
+networks:
+  uncloud:
+    external: true
+    name: uncloud

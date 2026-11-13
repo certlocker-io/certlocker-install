@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Preview or apply company-owned Cloudflare health routing for installed HA origins."""
+import argparse
+import json
+from pathlib import Path
+
+from uncloud_support import Trust, company_slug, inventory_directory, trust_name
+from uncloud_certificates import cloudflare_preflight
+from uncloud_cloudflare import Cloudflare, apply, check_access, plan, verify
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('company')
+    parser.add_argument('--zone', required=True)
+    parser.add_argument('--interval', type=int, default=60,
+                        help='Monitor seconds; shorter intervals require account support')
+    operation = parser.add_mutually_exclusive_group()
+    operation.add_argument('--apply', action='store_true', help='Apply owned resources; requires an enabled Load Balancing service')
+    operation.add_argument('--verify', action='store_true', help='Check existing configuration and origin health without writing')
+    args = parser.parse_args()
+    company = company_slug(args.company)
+    directory = inventory_directory(company)
+    identity = json.loads((directory / '.setup.json').read_text())
+    installation = json.loads((Path(identity['state_dir']) / 'installation.json').read_text())
+    config = installation['config']
+    inventory = json.loads((directory / 'hosts.json').read_text())
+    addresses = {node: host['ansible_host'] for node, host in
+                 inventory['all']['children']['uncloud']['hosts'].items()}
+    if (identity['company'] != company or installation['company'] != company or
+            sorted(addresses.values()) != sorted(identity['addresses']) or
+            sorted(addresses.values()) != sorted(installation['addresses'])):
+        raise ValueError('Inventory differs from the installation binding')
+    trust = Trust(group=config.get('trust_group') or company, account_id=config.get('trust_account_id'))
+    if config.get('registry_mode') == 'gcp':
+        trust.bind_account(company, config['trust_account_id'], config['trust_account_marker_id'])
+    names = trust.get(trust_name(company, 'vault_certlocker_ingress_settings'))
+    settings = plan(company, args.zone, [names['hostname'], names['backoffice_hostname']], addresses, args.interval)
+    if not args.apply and not args.verify:
+        print(json.dumps(settings, indent=2))
+        return
+    token, zone_id = cloudflare_preflight(company, trust, args.zone)
+    api = Cloudflare(token)
+    account = check_access(api, zone_id, args.zone)
+    print(json.dumps((verify if args.verify else apply)(api, zone_id, account, settings), indent=2))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, RuntimeError, OSError, KeyError) as error:
+        raise SystemExit(str(error)) from None

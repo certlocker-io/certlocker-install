@@ -1,0 +1,107 @@
+name: certlocker-uncloud-db
+services:
+  postgres:
+    image: docker.io/bitnamilegacy/postgresql-repmgr@sha256:4786542acf26d47f83d1a636d3d5c54ffd5156a4cdbd3eb1678d750046c9bccb
+    container_name: certlocker-uncloud-postgres
+    entrypoint: [/bin/bash, /opt/certlocker/database-start.sh]
+    command: [/opt/bitnami/scripts/postgresql-repmgr/run.sh]
+    user: '1001:0'
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    extra_hosts:
+      - "pg-{{ (groups['uncloud'] | difference([inventory_hostname]) | first) }}:{{ hostvars[(groups['uncloud'] | difference([inventory_hostname]) | first)].uncloud_mesh_ip }}"
+    networks:
+      default:
+        aliases: ["pg-{{ inventory_hostname }}"]
+    environment:
+      POSTGRESQL_POSTGRES_PASSWORD_FILE: /run/lab-secrets/postgres
+      POSTGRESQL_PASSWORD_FILE: /run/lab-secrets/postgres
+      POSTGRESQL_USERNAME: postgres
+      POSTGRESQL_DATABASE: certlocker_lab
+      REPMGR_PASSWORD_FILE: /run/lab-secrets/repmgr
+      REPMGR_PRIMARY_HOST: pg-{{ groups['uncloud'][0] }}
+      REPMGR_PARTNER_NODES: pg-{{ groups['uncloud'][0] }}:5432,pg-{{ groups['uncloud'][1] }}:5432
+      REPMGR_NODE_NAME: "{{ 'node-1' if inventory_hostname == groups['uncloud'][0] else 'node-2' }}"
+      REPMGR_NODE_NETWORK_NAME: "pg-{{ inventory_hostname }}"
+      REPMGR_NODE_ID: "{{ 1 if inventory_hostname == groups['uncloud'][0] else 2 }}"
+      REPMGR_USE_PASSFILE: 'true'
+      REPMGR_FAILOVER: automatic
+      UNCLOUD_DB_PEER: "pg-{{ (groups['uncloud'] | difference([inventory_hostname]) | first) }}"
+      UNCLOUD_DB_PEER_ID: "{{ 2 if inventory_hostname == groups['uncloud'][0] else 1 }}"
+      PGSSLMODE: require
+      POSTGRESQL_ENABLE_TLS: 'yes'
+      POSTGRESQL_TLS_CERT_FILE: /certs/server.crt
+      POSTGRESQL_TLS_KEY_FILE: /certs/server.key
+    ports:
+      - "{{ uncloud_mesh_ip }}:5432:5432"
+    volumes:
+      - postgres_repmgr_data:/bitnami/postgresql
+      - {{ database_runtime }}/secrets:/run/lab-secrets:ro
+      - {{ database_runtime }}/certs:/certs:ro
+      - /opt/certlocker/uncloud-db/database-start.sh:/opt/certlocker/database-start.sh:ro
+    tmpfs:
+      - /opt/bitnami/repmgr/conf:rw,nosuid,noexec,size=16m,uid=1001,gid=0,mode=0700
+      - /tmp:rw,nosuid,size=64m,mode=1777
+    healthcheck:
+      test: [CMD-SHELL, "pgrep -x repmgrd >/dev/null && pg_isready -U postgres -d certlocker_lab"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+    mem_limit: 768m
+    logging:
+      driver: local
+      options: {max-size: '20m', max-file: '5'}
+  pgpool:
+    image: docker.io/bitnamilegacy/pgpool@sha256:d3bf3910f148d7546df0762d1abed497cdeab01fdb239a337982e240a2d110ab
+    container_name: certlocker-uncloud-pgpool
+    user: '1001:0'
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    extra_hosts:
+      - "pg-{{ (groups['uncloud'] | difference([inventory_hostname]) | first) }}:{{ hostvars[(groups['uncloud'] | difference([inventory_hostname]) | first)].uncloud_mesh_ip }}"
+    environment:
+      PGPOOL_BACKEND_NODES: 0:pg-{{ groups['uncloud'][0] }}:5432,1:pg-{{ groups['uncloud'][1] }}:5432
+      PGPOOL_BACKEND_APPLICATION_NAMES: node-1,node-2
+      PGPOOL_SR_CHECK_USER: repmgr
+      PGPOOL_SR_CHECK_PASSWORD_FILE: /run/lab-secrets/repmgr
+      PGPOOL_POSTGRES_USERNAME: postgres
+      PGPOOL_POSTGRES_PASSWORD_FILE: /run/lab-secrets/postgres
+      PGPOOL_ADMIN_USERNAME: pgpool_admin
+      PGPOOL_ADMIN_PASSWORD_FILE: /run/lab-secrets/pgpool
+      PGPOOL_ENABLE_LOAD_BALANCING: 'no'
+      PGPOOL_AUTO_FAILBACK: 'yes'
+      # Repmgr owns promotion; Pgpool must promptly discover its elected writer.
+      PGPOOL_SR_CHECK_PERIOD: '2'
+      PGPOOL_HEALTH_CHECK_PERIOD: '2'
+      PGPOOL_HEALTH_CHECK_TIMEOUT: '3'
+      PGPOOL_HEALTH_CHECK_MAX_RETRIES: '2'
+      PGPOOL_HEALTH_CHECK_RETRY_DELAY: '1'
+      PGPOOL_CONNECT_TIMEOUT: '2000'
+      PGPOOL_HEALTH_CHECK_PSQL_TIMEOUT: '3'
+      PGPOOL_NUM_INIT_CHILDREN: '{{ 32 if uncloud_with_apps | default(false) else 8 }}'
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - {{ database_runtime }}/secrets:/run/lab-secrets:ro
+    tmpfs:
+      - /opt/bitnami/pgpool/conf:rw,nosuid,noexec,size=16m,uid=1001,gid=0,mode=0700
+      - /tmp:rw,nosuid,size=64m,mode=1777
+    healthcheck:
+      test: [CMD, /opt/bitnami/scripts/pgpool/healthcheck.sh]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+    mem_limit: 256m
+    logging:
+      driver: local
+      options: {max-size: '20m', max-file: '5'}
+networks:
+  default:
+    external: true
+    name: uncloud
+volumes:
+  postgres_repmgr_data: {}

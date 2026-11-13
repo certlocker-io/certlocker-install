@@ -1,0 +1,87 @@
+---
+- name: Install HAProxy origins with real application readiness
+  hosts: uncloud
+  serial: 1
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    ingress_root: "/opt/certlocker/{{ uncloud_company }}/uncloud-ingress"
+  tasks:
+    - name: Validate the shared frontend HTTP request budget
+      ansible.builtin.assert:
+        that:
+          - (uncloud_http_rate_limit | default(400) | string) is match('^[1-9][0-9]{0,5}$')
+        fail_msg: HTTP rate limit must be an integer from 1 to 999999
+
+    - name: Create private configuration and runtime socket directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+      loop:
+        - "{{ ingress_root }}"
+        - "/run/certlocker/{{ uncloud_company }}/haproxy"
+        - "/run/certlocker/{{ uncloud_company }}/ingress"
+
+    - name: Install the verified origin certificate from Trust
+      ansible.builtin.copy:
+        dest: "/run/certlocker/{{ uncloud_company }}/ingress/ingress.pem"
+        content: "{{ uncloud_ingress_pem }}"
+        mode: '0400'
+      no_log: true
+      when: not (uncloud_ingress_bootstrap_only | default(false) | bool)
+
+    - name: Render ingress configuration
+      ansible.builtin.template:
+        src: "../uncloud/ingress/{{ item }}.j2"
+        dest: "{{ ingress_root }}/{{ item }}"
+        mode: '0600'
+      loop: [compose.yaml, haproxy.cfg]
+      register: ingress_configuration
+
+    - name: Check whether this origin is already running
+      ansible.builtin.command:
+        cmd: docker ps --filter name=^/certlocker-haproxy$ --format '{{ "{{.Names}}" }}'
+      register: ingress_running
+      changed_when: false
+
+    - name: Pull the immutable HAProxy image
+      ansible.builtin.command:
+        cmd: docker compose pull --quiet
+        chdir: "{{ ingress_root }}"
+      changed_when: false
+
+    - name: Precreate the first origin so certificate activation only starts it
+      ansible.builtin.command:
+        cmd: docker compose create --no-recreate --pull never haproxy
+        chdir: "{{ ingress_root }}"
+      when: uncloud_ingress_bootstrap_only | default(false) | bool
+
+    - name: Validate HAProxy configuration before starting the origin
+      ansible.builtin.command:
+        cmd: docker compose run --rm --no-deps haproxy haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg
+        chdir: "{{ ingress_root }}"
+      changed_when: false
+      when: not (uncloud_ingress_bootstrap_only | default(false) | bool) or ingress_running.stdout | trim != ''
+
+    - name: Expose only HTTP and HTTPS origin listeners
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+        comment: CertLocker HAProxy origin
+      loop: ['80', '443']
+
+    - name: Start HAProxy and require backend readiness
+      ansible.builtin.command:
+        cmd: docker compose up -d --wait --wait-timeout 120
+        chdir: "{{ ingress_root }}"
+      when: not (uncloud_ingress_bootstrap_only | default(false) | bool) or ingress_running.stdout | trim != ''
+
+    - name: Gracefully reload changed HAProxy configuration on an existing origin
+      ansible.builtin.command:
+        argv: [docker, exec, certlocker-haproxy, sh, -c, 'kill -USR2 1']
+      when:
+        - ingress_running.stdout | trim != ''
+        - ingress_configuration.changed

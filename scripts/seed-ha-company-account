@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""Seed a verified company superuser and its own credentials with DAOMigrate."""
+import argparse
+from contextlib import ExitStack
+from uncloud_host_access import installation_key
+import datetime
+import getpass
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import warnings
+import re
+import shlex
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+from uncloud_support import Trust, company_slug, inventory_directory, run_ansible, trust_name
+from uncloud_host_access import platform_seed
+
+ROOT = Path(__file__).resolve().parents[1]
+FREE_TIER_ID = '2pc4im00jo'
+
+
+def decode_database_json(output):
+    # psql prints SQL NULL as an empty field; json_agg over no rows is NULL.
+    value = output.strip()
+    try:
+        return json.loads(value) if value else None
+    except (ValueError, TypeError):
+        raise RuntimeError('Company account preflight response was invalid; output suppressed') from None
+
+
+def stable_focus_id(kind, *parts):
+    encoded = ', '.join(json.dumps(value, ensure_ascii=True) for value in (kind, *parts))
+    return 'focus-' + hashlib.sha256(('[' + encoded + ']').encode()).hexdigest()[:24]
+
+
+def grafana_login_secret(company, trust):
+    """Grafana admin login for the company monitoring UI (default user admin)."""
+    password = trust.get(trust_name(company, 'vault_grafana_admin_password'))
+    if not isinstance(password, str) or not password.strip():
+        raise ValueError(
+            'Grafana admin password is missing from company Trust; '
+            'refusing to finish without monitoring login credentials'
+        )
+    ingress = trust.get(trust_name(company, 'vault_certlocker_ingress_settings'))
+    host = ''
+    if isinstance(ingress, dict):
+        host = (ingress.get('grafana_hostname') or '').strip()
+    url = ('https://' + host) if host else ''
+    # Compose sets only GF_SECURITY_ADMIN_PASSWORD; Grafana's default user is admin.
+    return {
+        'username': 'admin',
+        'password': password.strip(),
+        'url': url,
+        'secret': json.dumps({'username': 'admin', 'password': password.strip()}, sort_keys=True),
+    }
+
+
+def bootstrap_password_hash(existing_user=None):
+    # Interactive resume without a supplied password keeps the working hash.
+    # Unattended acceptance always passes CERTLOCKER_INITIAL_ADMIN_PASSWORD and
+    # must be able to sign in with that value after resume.
+    if (existing_user and 'SUPER_USER_FE' in (existing_user.get('role_ids') or [])
+            and not os.environ.get('CERTLOCKER_INITIAL_ADMIN_PASSWORD')):
+        return None
+    password = os.environ.pop('CERTLOCKER_INITIAL_ADMIN_PASSWORD','')
+    if not password:
+        if not sys.stdin.isatty():
+            raise ValueError('Initial superuser password requires hidden terminal input or CERTLOCKER_INITIAL_ADMIN_PASSWORD')
+        with warnings.catch_warnings():
+            warnings.simplefilter('error',getpass.GetPassWarning)
+            try:
+                password=getpass.getpass('Set the company superuser password (hidden): ')
+                confirm=getpass.getpass('Confirm the company superuser password (hidden): ')
+            except getpass.GetPassWarning:
+                raise ValueError('Superuser password requires a terminal with hidden input') from None
+        if not password or password!=confirm:
+            raise ValueError('Superuser passwords must be non-empty and match')
+    try:
+        from argon2 import PasswordHasher, Type
+    except ImportError:
+        raise ValueError('Install argon2-cffi before creating the application account') from None
+    return PasswordHasher(time_cost=2,memory_cost=19456,parallelism=1,
+                          hash_len=32,salt_len=16,type=Type.ID).hash(password)
+
+
+def main(argv=None):
+    with ExitStack() as key_access:
+        return run_main(argv, key_access)
+
+
+def run_main(argv, key_access):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('company', type=company_slug)
+    parser.add_argument('--account-domain', required=True)
+    parser.add_argument('--display-name', required=True)
+    parser.add_argument('--admin-email', required=True)
+    args = parser.parse_args(argv)
+    domain = args.account_domain.lower().strip()
+    email = args.admin_email.strip().lower()
+    display_name = args.display_name.strip()
+    if not re.fullmatch(r'(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}', domain):
+        raise ValueError('Company account domain is invalid')
+    if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email):
+        raise ValueError('Company superuser email is invalid')
+    if not display_name:
+        raise ValueError('Company superuser display name is required')
+
+    directory = inventory_directory(args.company)
+    marker = json.loads((directory / '.setup.json').read_text())
+    marker['ssh_key_path'] = key_access.enter_context(installation_key(args.company, directory, marker))
+    inventory_doc = json.loads((directory / 'hosts.json').read_text())
+    children = inventory_doc.get('all', {}).get('children', {})
+    candidates = [item for item in children.values() if isinstance(item, dict) and isinstance(item.get('hosts'), dict)]
+    if len(candidates) != 1 or len(candidates[0]['hosts']) != 2:
+        raise ValueError('Expected exactly one generated two-host installation inventory')
+    inventory = candidates[0]
+    hosts = inventory['hosts']
+    user = inventory['vars']['ansible_user']
+
+    setup_loader = importlib.machinery.SourceFileLoader('ha_setup', str(ROOT / 'scripts/setup-ha'))
+    setup_spec = importlib.util.spec_from_loader(setup_loader.name, setup_loader)
+    setup = importlib.util.module_from_spec(setup_spec)
+    setup_loader.exec_module(setup)
+    setup.prepare_ssh(Path(marker['state_dir']))
+    for name, host in hosts.items():
+        observed = setup.ssh(marker['ssh_key_path'], host['ansible_host'], 'hostname -s', user=user).strip()
+        if observed != host.get('uncloud_expected_hostname', name):
+            raise ValueError('Connected server identity differs from the saved installation inventory')
+
+    primary = hosts[sorted(hosts)[0]]['ansible_host']
+
+    def database(query):
+        remote_inner = ('export PGPASSWORD="$(cat /run/lab-secrets/postgres)" PGSSLMODE=require; '
+                        'exec psql -h 127.0.0.1 -U postgres -d certlocker -At -v ON_ERROR_STOP=1')
+        remote = shlex.join(['sudo', '-n', 'docker', 'exec', '-i', 'certlocker-uncloud-postgres',
+                             'bash', '-ec', remote_inner])
+        result = subprocess.run(['ssh', '-i', marker['ssh_key_path'], '-o', 'BatchMode=yes',
+                                 user + '@' + primary, remote], input=query, capture_output=True,
+                                text=True, timeout=30)
+        if result.returncode:
+            raise RuntimeError('Company account preflight failed; database output suppressed')
+        return decode_database_json(result.stdout)
+
+    group = inventory['vars'].get('uncloud_trust_group', args.company)
+    trust = Trust(group=group, account_id=inventory['vars'].get('uncloud_trust_account_id'))
+    if inventory['vars'].get('uncloud_registry_mode') == 'gcp':
+        trust.bind_account(args.company, inventory['vars'].get('uncloud_trust_account_id'),
+                           inventory['vars'].get('uncloud_trust_account_marker_id'))
+    saved_email = trust.get(trust_name(args.company, 'vault_certlocker_initial_admin_email'))
+    saved_domain = trust.get(trust_name(args.company, 'vault_certlocker_company_account_domain'))
+    if saved_email != email or saved_domain != domain:
+        raise ValueError('Superuser email/domain differ from the values saved in company Trust')
+
+    email_sql = email.replace("'", "''")
+    domain_sql = domain.replace("'", "''")
+    users = database("SELECT json_agg(json_build_object('id',u.id,'account_id',a.id,'owner_id',a.accountowner,"
+                     "'status',u.status,'account_status',a.status,'role_ids',u.roleids)) "
+                     "FROM jeremy.users u JOIN jeremy.accounts a ON a.id=u.accountid "
+                     "WHERE u.nodetype='EDGE' AND lower(u.email)=lower('" + email_sql + "');")
+    domain_accounts = database("SELECT json_agg(DISTINCT jsonb_build_object('id',a.id,'name',a.name,"
+                               "'owner_id',a.accountowner,'status',a.status,'tier_id',a.tierid)) "
+                               "FROM jeremy.accounts a JOIN jeremy.users u ON u.accountid=a.id "
+                               "WHERE a.status='ACTIVE' AND lower(split_part(u.email,'@',2))='" + domain_sql + "';")
+    if not isinstance(domain_accounts, list):
+        domain_accounts = []
+    stable_account_id = stable_focus_id('account', domain)
+    if len(domain_accounts) > 1:
+        raise ValueError('More than one active account already contains users from this domain; refusing to choose')
+    if domain_accounts:
+        account = domain_accounts[0]
+        new_account = False
+    else:
+        by_id = database("SELECT json_agg(json_build_object('id',id,'name',name,'owner_id',accountowner,"
+                          "'status',status,'tier_id',tierid)) FROM jeremy.accounts WHERE id='" + stable_account_id + "';")
+        if by_id:
+            account = by_id[0]
+            if account.get('status') != 'ACTIVE':
+                raise ValueError('The domain-derived account exists but is not active')
+            if not account.get('owner_id'):
+                raise ValueError('The existing domain-derived account has no owner; refusing to replace it')
+            new_account = False
+        else:
+            free_tier = database("SELECT json_agg(id) FROM jeremy.tiers WHERE tiertype='FREE';")
+            if not isinstance(free_tier, list) or len(free_tier) != 1 or free_tier[0] != FREE_TIER_ID:
+                raise ValueError('The default FREE account tier is missing or ambiguous; refusing to invent a tier')
+            account = {'id': stable_account_id, 'name': domain, 'owner_id': None,
+                       'status': 'ACTIVE', 'tier_id': FREE_TIER_ID}
+            new_account = True
+    if not new_account and not account.get('owner_id'):
+        raise ValueError('The existing company domain account has no owner; refusing to attach credentials')
+
+    user_id = stable_focus_id('user', email.lower())
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec='seconds')
+    user_update = None
+    if users:
+        if not isinstance(users, list) or len(users) != 1 or users[0].get('status') != 'ACTIVE':
+            raise ValueError('A matching superuser email exists in a non-active or ambiguous state')
+        if users[0].get('account_id') != account['id']:
+            raise ValueError('The superuser email already belongs to a different account')
+        user_id = users[0]['id']
+        password_hash = bootstrap_password_hash(users[0])
+        if password_hash is not None:
+            user_update = {'id':user_id,'email':email,'display_name':display_name,'password':password_hash}
+            if 'SUPER_USER_FE' in (users[0].get('role_ids') or []):
+                print('Updating the existing company superuser password from the supplied acceptance secret.',flush=True)
+            else:
+                print('Promote the existing active company user to superuser.',flush=True)
+        else:
+            print('Reusing the existing company superuser; its password is preserved.',flush=True)
+        user_rows = []
+        registration_rows = []
+        account_rows = []
+    else:
+        conflict = database("SELECT json_agg(json_build_object('id',id)) FROM jeremy.users WHERE id='" + user_id + "';")
+        if conflict:
+            raise ValueError('Stable user identity is already used by a different registration')
+        password_hash = bootstrap_password_hash()
+        account_rows = []
+        if new_account:
+            account_rows = [{
+                'id': account['id'], 'name': domain, 'status': 'ACTIVE', 'account_owner': user_id,
+                'tier_id': account['tier_id'], 'root_token': account['id'] + '-' + uuid.uuid4().hex,
+                'password_config': {'minimum_length': 10, 'minimum_numerics': 1,
+                                    'minimum_upper': 1, 'minimum_alpha': 1,
+                                    'minimum_special': 1, 'change_period': 'MONTHLY'},
+                'date_created': datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec='seconds'),
+                'date_updated': datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec='seconds')}]
+        user_rows = [{
+            'id': user_id, 'account_id': account['id'], 'email': email,
+            'display_name': display_name, 'node_type': 'EDGE', 'password': password_hash,
+            'status': 'ACTIVE', 'tfa_auth': 'NONE', 'email_verified': True,
+            'email_verification_attempts': 0, 'login_attempts': 0,
+            'role_ids': ['SUPER_USER_FE'], 'groups': [], 'change_period': 'MONTHLY',
+            're_login_type': 'DAILY', 'date_created': now, 'date_updated': now}]
+        registration_rows = [{'id': user_id, 'account_id': account['id'],
+                              'account_name': domain, 'username': email,
+                              'intended_tier_id': account.get('tier_id', FREE_TIER_ID),
+                              'verified': True, 'utms': {'source': 'setup-ha', 'medium': 'bootstrap'},
+                              'date_created': now, 'date_updated': now}]
+        print('Prepared a password-authenticated, email-verified superuser directly for the domain account; no verification email is sent.', flush=True)
+
+    references = json.loads((directory / 'host-access.json').read_text())
+    access = platform_seed(args.company, group, account['id'], user_id, references, hosts, trust)
+    tables = {}
+    if account_rows:
+        tables['accounts'] = account_rows
+    if user_rows:
+        tables['users'] = user_rows
+    if registration_rows:
+        tables['registrations'] = registration_rows
+    tables.update(access)
+
+    private_rows = []
+    base = {'account_id': account['id'], 'user_id': user_id, 'created_by': user_id,
+            'create_by_email': email, 'version': 1, 'date_created': now if not users else datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec='seconds'),
+            'date_updated': now if not users else datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(timespec='seconds')}
+
+    def private_asset(kind, name, description, secret_type, secret, url=''):
+        private_rows.append({**base, 'id': str(uuid.uuid5(uuid.NAMESPACE_URL,
+            'certlocker:uncloud:private:' + args.company + ':' + email.lower() + ':' + kind)),
+            'name': name, 'description': description, 'secret_type': secret_type,
+            'secret': secret, 'url': url})
+
+    key_value = trust.get(references['ssh_key_record'])
+    if not isinstance(key_value, str) or not key_value.startswith('-----BEGIN '):
+        raise ValueError('The customer provisioning SSH private key is missing from company Trust')
+    private_asset('ssh-key', args.company + ' server SSH key', 'SSH key used by CertLocker Terminal to access both installed hosts.',
+                  'PEM', key_value)
+
+    from uncloud_smtp import SETTINGS as SMTP_SETTINGS, PASSWORD as SMTP_PASSWORD
+    smtp = trust.get(trust_name(args.company, SMTP_SETTINGS))
+    if isinstance(smtp, dict) and smtp.get('smtp_mode') == 'customer' and smtp.get('smtp_enabled') is True:
+        smtp_password = trust.get(trust_name(args.company, SMTP_PASSWORD))
+        if not isinstance(smtp_password, str) or not smtp_password:
+            raise ValueError('Customer SMTP password is missing; refusing to import partial credentials')
+        private_asset('customer-smtp', args.company + ' SMTP credentials',
+                      'Customer supplied SMTP credentials for the company mail server.', 'CREDENTIALS',
+                      json.dumps({'username': smtp['smtp_user'], 'password': smtp_password,
+                                  'host': smtp['smtp_host'], 'port': int(smtp['smtp_port']),
+                                  'tls': smtp['smtp_tls']}, sort_keys=True),
+                      'smtp://' + smtp['smtp_host'] + ':' + str(smtp['smtp_port']))
+
+    from uncloud_certificates import cloudflare_preflight
+    cert_settings = trust.get(trust_name(args.company, 'vault_certlocker_certificate_settings'))
+    if isinstance(cert_settings, dict) and cert_settings.get('certificate_mode') == 'customer':
+        zone = cert_settings.get('dns_zone')
+        token, _ = cloudflare_preflight(args.company, trust, zone)
+        private_asset('cloudflare-api-token', args.company + ' Cloudflare API token',
+                      'Customer supplied Cloudflare DNS API token for certificate automation.',
+                      'PASSWORD', token, 'https://api.cloudflare.com/')
+
+    grafana = grafana_login_secret(args.company, trust)
+    private_asset(
+        'grafana-admin',
+        args.company + ' Grafana admin',
+        'Grafana administrator username and password for the company monitoring dashboard.',
+        'CREDENTIALS',
+        grafana['secret'],
+        grafana['url'],
+    )
+
+    tables['private_secrets'] = private_rows
+    print('Load only the account, superuser, Terminal hosts, Grafana login and customer-owned credentials through append-only DAOMigrate.', flush=True)
+    extra_vars = {'ansible_remote_tmp': '/run/certlocker-' + args.company + '-ansible'}
+    secret_values = {'uncloud_certificate_seed': tables}
+    if user_update:
+        secret_values['uncloud_account_user_update'] = user_update
+    run_ansible(['ansible-playbook', '-i', directory / 'hosts.json', ROOT / 'playbooks/uncloud_certificate_seed.yml',
+                 '--private-key', marker['ssh_key_path'], '-e', json.dumps(extra_vars)],
+                secret_values)
+    print('Company application account, superuser, Terminal SSH access, Grafana login and supplied credentials were loaded.', flush=True)
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, RuntimeError) as error:
+        raise SystemExit(str(error))
+    except Exception as error:
+        raise SystemExit('Company account bootstrap stopped: ' + type(error).__name__) from None

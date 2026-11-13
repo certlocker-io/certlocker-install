@@ -1,0 +1,954 @@
+#!/usr/bin/env python3
+"""Set up a company's two supplied Ubuntu servers, with mandatory hardening.
+
+Provider adapters verify supplied machines and can identify Google VMs by IP and zone.
+Never accepts production inventories or invokes the production HA playbook.
+"""
+import argparse
+from contextlib import ExitStack
+from uncloud_host_access import runtime_ssh_key, setup_key
+from uncloud_ssh import SSH_OPTIONS, run_ssh, wait_for_ssh
+import ipaddress
+import json
+import os
+from pathlib import Path
+import hashlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from urllib.parse import urlsplit
+
+ROOT = Path(__file__).resolve().parents[1]
+from uncloud_nodes import node_names
+from uncloud_access import CERTLOCKER_UPDATER_CIDRS, monitoring_access, with_updater
+NAMES = node_names("certlocker")
+CONTEXT = "certlocker-uncloud"
+VERSION = "0.21.0"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from certlocker_gateway import GatewayRoutes
+from uncloud_support import (Trust, MISSING, company_slug, inventory_directory, trust_name, initialize_environment, initialize_database_identity,
+                             release_manifest, write_trust_references, read_master_key, resolve_environment, run_ansible,
+                             require_deployment,
+                             prepare_ingress, bundled_release_manifest)
+from uncloud_progress import Progress, PLAY_LABELS
+
+
+def prepare_uncloud_config(path, context, create=True, *, ssh_key=None, targets=None):
+    import yaml
+    # Mesh CLI 0.21 auto-selects the controller's local daemon if the specified
+    # config does not exist, even with --context. An existing empty config forces
+    # the intended isolated config path. Never modify the controller's daemon.
+    if not path.exists():
+        if not create:
+            raise ValueError('Installation mesh config is missing; refusing local-daemon fallback')
+        private_write(path, 'contexts: {}\n')
+    try:
+        document = yaml.safe_load(path.read_text()) or {}
+    except yaml.YAMLError:
+        raise ValueError('Could not parse the private installation mesh config') from None
+    if not isinstance(document, dict):
+        raise ValueError('Could not parse the private installation mesh config')
+    contexts = document.get('contexts', {})
+    if not isinstance(contexts, dict) or set(contexts) - {context}:
+        raise ValueError('Mesh config contains unexpected cluster contexts')
+    if context not in contexts:
+        return True
+    if ssh_key is not None:
+        # uc persists --ssh-key from init/add. Each run retrieves the same
+        # identity into a new tmpfs file, so saved connections must follow it.
+        saved = contexts[context]
+        connections = saved.get('connections') if isinstance(saved, dict) else None
+        if not isinstance(connections, list) or not connections:
+            raise ValueError('Installation mesh context has no SSH connections')
+        seen = set()
+        for connection in connections:
+            if (not isinstance(connection, dict) or connection.get('ssh') not in (targets or ())
+                    or connection['ssh'] in seen or set(connection) - {'ssh', 'ssh_key_file', 'machine_id'}):
+                raise ValueError('Installation mesh connection differs from the intended servers')
+            seen.add(connection['ssh'])
+        # Validate the entire context before changing any saved connection.
+        for connection in connections:
+            connection['ssh_key_file'] = str(ssh_key)
+        private_write(path, yaml.safe_dump(document, sort_keys=False))
+    return False
+
+
+def timing_stage_key(row):
+    return row.get('stage') or row.get('playbook')
+
+
+def passed_timing_prefix(rows):
+    """Consecutive passed stages from the start of a prior timings-setup.json."""
+    prefix = []
+    for row in rows or []:
+        if not isinstance(row, dict) or row.get('status') != 'passed' or not timing_stage_key(row):
+            break
+        prefix.append(row)
+    return prefix
+
+
+def load_continue_prefix(state_dir, enabled):
+    if not enabled:
+        return []
+    path = Path(state_dir) / 'timings-setup.json'
+    if not path.exists():
+        return []
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    return passed_timing_prefix(document.get('playbooks') or [])
+
+
+def prepare_ssh(state_dir):
+    """Keep replacement-host trust and connections inside this installation."""
+    # A nested setup/deploy command inherits these wrappers in PATH. Never
+    # rewrite a wrapper to exec itself (an endless shell loop).
+    search = []
+    for entry in os.environ['PATH'].split(os.pathsep):
+        candidate = Path(entry) / 'ssh'
+        try:
+            with candidate.open('rb') as stream:
+                prefix = stream.read(1024)
+            if prefix.startswith(b'#!/bin/sh\n') and b'UserKnownHostsFile=' in prefix:
+                continue
+        except OSError:
+            pass
+        search.append(entry)
+    executables = {name: shutil.which(name, path=os.pathsep.join(search)) for name in ('ssh', 'scp', 'sftp')}
+    if not all(executables.values()):
+        raise ValueError("OpenSSH ssh/scp/sftp clients are required")
+    options = [*SSH_OPTIONS, "-o", f"UserKnownHostsFile={state_dir / 'known_hosts'}",
+               "-o", "StrictHostKeyChecking=accept-new"]
+    for name, executable in executables.items():
+        wrapper = state_dir / "bin" / name
+        private_write(wrapper, "#!/bin/sh\nexec " + shlex.join([executable, *options]) + ' "$@"\n')
+        wrapper.chmod(0o700)
+    os.environ["PATH"] = str(state_dir / 'bin') + os.pathsep + os.environ["PATH"]
+    for name in ('UNCLOUD_CONNECT', 'UNCLOUD_AUTO_CONFIRM'):
+        os.environ.pop(name, None)
+    os.environ['ANSIBLE_CONFIG'] = str(ROOT / 'ansible.cfg')
+    # Each server has an inventory-owned /run tmpfs path. run_ansible supplies
+    # a controller-owned tmpfs fallback for tasks delegated to localhost.
+    os.environ.pop('ANSIBLE_REMOTE_TMP', None)
+    for name in ('ssh', 'scp', 'sftp'):
+        os.environ[f'ANSIBLE_{name.upper()}_EXECUTABLE'] = str(state_dir / 'bin' / name)
+
+
+def run(args, capture=False):
+    result = subprocess.run([*map(str, args)], cwd=ROOT,
+                            text=True, capture_output=capture, check=True)
+    return result.stdout if capture else ""
+
+
+def private_write(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        stream.write(content)
+    path.chmod(0o600)
+
+
+def validate_config(config):
+    rate_limit = config.get('http_rate_limit', 400)
+    if type(rate_limit) is not int or not 1 <= rate_limit <= 999999:
+        raise ValueError('http_rate_limit must be an integer from 1 to 999999')
+    require_deployment(config)
+    cidrs = config.get("operator_cidrs", [])
+    if not cidrs or any(ipaddress.ip_network(c).version != 4 or
+                        ipaddress.ip_network(c).prefixlen != 32 for c in cidrs):
+        raise ValueError("operator_cidrs must contain explicit IPv4 /32 addresses")
+    vpn_cidrs = config.get('vpn_cidrs', [])
+    if any(ipaddress.ip_network(c).version != 4 or ipaddress.ip_network(c).prefixlen != 32
+           for c in vpn_cidrs):
+        raise ValueError('vpn_cidrs must contain explicit IPv4 /32 addresses')
+    return validate_ssh_identity(config)
+
+
+def parse_vpn_cidrs(value):
+    """Parse a comma-separated list of VPN egress IPv4 addresses."""
+    if not value.strip():
+        return []
+    result = []
+    for item in value.split(','):
+        address = ipaddress.ip_network(item.strip(), strict=False)
+        if address.version != 4 or address.prefixlen != 32:
+            raise ValueError('VPN entries must be IPv4 addresses (single hosts), separated by commas')
+        result.append(str(address))
+    return sorted(set(result))
+
+
+def ui_hostname(value, zone):
+    value = value.strip()
+    if '://' not in value:
+        value = 'https://' + value
+    parsed = urlsplit(value)
+    hostname = (parsed.hostname or '').lower()
+    if (parsed.scheme != 'https' or parsed.username or parsed.password or
+            parsed.port not in (None, 443) or parsed.path not in ('', '/') or
+            parsed.query or parsed.fragment or
+            not re.fullmatch(r'(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}', hostname)):
+        raise ValueError('Supply an HTTPS URL with a valid hostname and no path, query, or custom port')
+    suffix = '.' + zone.lower()
+    if not hostname.endswith(suffix) or '.' in hostname[:-len(suffix)]:
+        raise ValueError('UI URLs must each be one hostname level below the selected DNS zone for wildcard certificate coverage')
+    return hostname
+
+
+def validate_ssh_identity(config):
+    user = config.get('ssh_user', 'ubuntu')
+    if user == 'root' or not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_-]*', user):
+        raise ValueError('Supply a non-root SSH user with passwordless sudo')
+    key = runtime_ssh_key(config["ssh_private_key"])
+    if not key.is_file():
+        raise ValueError("SSH identity does not exist; supply its path, never its contents")
+    return key
+
+
+def resolve_node(provider, address, name, config):
+    ipaddress.IPv4Address(address)
+    settings = config["nodes"][name]
+    expected_hostname = settings.get('expected_hostname')
+    if provider == "google":
+        instances = json.loads(run([
+            "gcloud", "compute", "instances", "list", "--project", config["google_project"],
+            "--filter=networkInterfaces.accessConfigs.natIP=" + address,
+            "--format=json(name,status,networkInterfaces,zone,machineType,disks)", "--quiet"], capture=True))
+        matches = [item for item in instances
+                   if item.get('status') == 'RUNNING' and
+                   item.get('zone', '').rstrip('/').endswith('/' + settings['zone']) and
+                   any(access.get('natIP') == address for nic in item.get('networkInterfaces', [])
+                       for access in nic.get('accessConfigs', []))]
+        if len(matches) != 1:
+            raise ValueError(f'{name}: address must identify exactly one running Google instance in zone {settings["zone"]}')
+        instance = matches[0]
+        actual_machine_type = instance.get('machineType', '').rsplit('/', 1)[-1]
+        expected_machine_type = settings.get('machine_type')
+        if expected_machine_type and actual_machine_type != expected_machine_type:
+            raise ValueError(f'{name}: supplied Google VM is {actual_machine_type}; expected {expected_machine_type}')
+        boot_disks = [disk for disk in instance.get('disks', []) if disk.get('boot')]
+        minimum_disk_gb = int(config.get('boot_disk_size_gb', 100))
+        if len(boot_disks) != 1 or int(boot_disks[0].get('diskSizeGb', 0)) < minimum_disk_gb:
+            raise ValueError(f'{name}: Google boot disk must be at least {minimum_disk_gb} GiB')
+        nic = next(nic for nic in instance["networkInterfaces"]
+                   if any(access.get('natIP') == address for access in nic.get('accessConfigs', [])))
+        peer_address = settings.get("wireguard_endpoint", nic["networkIP"])
+        if peer_address not in {nic["networkIP"], address}:
+            raise ValueError("Google WireGuard endpoint must be this machine's private or public address")
+        expected_hostname = expected_hostname or ssh(runtime_ssh_key(config['ssh_private_key']), address,
+                                                     'hostname -s', user=config.get('ssh_user', 'ubuntu')).strip()
+    elif provider == 'supplied':
+        # SSH and the supplied key are the customer's machine enrollment path.
+        # No cloud SDK, metadata endpoint, provider account or Terraform needed.
+        peer_address = settings.get('wireguard_endpoint', address)
+        expected_hostname = expected_hostname or ssh(
+            runtime_ssh_key(config['ssh_private_key']), address, 'hostname -s',
+            user=config.get('ssh_user', 'ubuntu')).strip()
+        if not re.fullmatch(r'[a-zA-Z0-9_.-]+', expected_hostname):
+            raise ValueError(f'{name}: invalid hostname returned by SSH')
+        settings = dict(settings, expected_hostname=expected_hostname)
+    else:
+        raise ValueError(f"Provider {provider!r} has no adapter; refusing to guess")
+    ipaddress.IPv4Address(peer_address)
+    return {"ansible_host": address, "uncloud_private_ip": peer_address,
+            "uncloud_provider": provider,
+            "uncloud_expected_hostname": expected_hostname or name}
+
+
+def ssh(key, host, command, user='ucdeploy'):
+    return run_ssh(key, host, command, user=user)
+
+
+def main(argv=None):
+    with ExitStack() as key_access:
+        return run_setup(argv, key_access)
+
+
+def run_setup(argv, key_access):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('company', nargs='?', help='Company inventory slug, e.g. acme')
+    parser.add_argument("server_1", nargs='?')
+    parser.add_argument("server_2", nargs='?')
+    parser.add_argument("--provider-1", choices=["google", "supplied"], default="google")
+    parser.add_argument("--provider-2", choices=["google", "supplied"], default="google")
+    parser.add_argument("--config", type=Path, help="Optional non-secret installation JSON")
+    parser.add_argument('--ssh-key', type=Path, help='Customer-provided SSH private key path; never key contents')
+    parser.add_argument('--ssh-user', help='Non-root SSH/sudo account (default ubuntu without a config)')
+    parser.add_argument('--trust-group', help='Exact company Trust group, for example Lottomart')
+    parser.add_argument('--project', help='Google Cloud project for Google-hosted servers')
+    parser.add_argument('--zone-1', help='Google Compute zone for server 1')
+    parser.add_argument('--zone-2', help='Google Compute zone for server 2')
+    parser.add_argument('--machine-type-1', help='Google VM type for server 1 (default e2-standard-2)')
+    parser.add_argument('--machine-type-2', help='Google VM type for server 2 (default e2-standard-2)')
+    parser.add_argument('--boot-disk-size-gb', type=int, help='Expected Google boot disk size (default 100 GiB)')
+    parser.add_argument('--front-url', help='Front-office HTTPS URL inside the selected DNS zone')
+    parser.add_argument('--backoffice-url', help='Backoffice HTTPS URL inside the selected DNS zone')
+    parser.add_argument('--grafana-url', help='Grafana HTTPS URL inside the selected DNS zone')
+    parser.add_argument('--admin-email', help='Email address for the company superuser')
+    parser.add_argument('--account-domain', help='Email domain used to create or select the company account')
+    parser.add_argument('--admin-display-name', help='Display name for the company superuser')
+    parser.add_argument('--vpn-ips', help='Comma-separated VPN egress IPv4 addresses allowed to access monitoring')
+    parser.add_argument('--vpn-ip', action='append', help='VPN egress IPv4 address allowed to access monitoring (repeatable)')
+    parser.add_argument('--certificate-mode', choices=['customer'], help='Who owns the Cloudflare provider credential')
+    parser.add_argument('--deployment', choices=['dev', 'prod'],
+                        help='Deployment type for this environment (dev or prod)')
+    parser.add_argument('--reuse-issued-certificate', action='store_true',
+                        help='For non-production rebuilds, reuse a valid company Trust shortlived certificate and schedule renewal')
+    parser.add_argument('--dns-zone', help='Customer Cloudflare zone name; API token is prompted securely')
+    parser.add_argument('--acme-email', help='Customer ACME registration email')
+    balancing = parser.add_mutually_exclusive_group()
+    balancing.add_argument('--cloudflare-load-balancing', dest='cloudflare_load_balancing', action='store_true',
+                           help='Enable Cloudflare HTTPS health routing with cookie session affinity (default)')
+    balancing.add_argument('--no-cloudflare-load-balancing', dest='cloudflare_load_balancing', action='store_false',
+                           help='Opt out of Cloudflare Load Balancing')
+    parser.set_defaults(cloudflare_load_balancing=None)
+    parser.add_argument('--non-interactive', action='store_true', help='Require settings and Trust records or environment credentials instead of prompts')
+    parser.add_argument('--store-ssh-key', action='store_true', help='Store the dedicated provisioning SSH key and server platform inventory in company Trust')
+    parser.add_argument('--operator-cidr', action='append', help='Operator IPv4 /32; discovered through SSH if omitted')
+    parser.add_argument("--until", choices=["harden", "network", "database", 'apps'], default='apps')
+    parser.add_argument('--version', '--release', dest='release', default='latest', help='Application version, e.g. --version=1.1.25; default latest stable')
+    parser.add_argument('--manifest-file', type=Path, help='Use a supplied immutable release manifest and adjacent .sha256 instead of GitHub authentication')
+    parser.add_argument('--master-key-file', type=Path, help='Optional owner-only file containing a base64 32-byte master key; otherwise generate once in Trust')
+    parser.add_argument('--replace-inventory', action='store_true', help='Explicitly replace this generated company inventory after destroying its old machines')
+    parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument('--continue', dest='continue_from_timings', action='store_true',
+                        help='Skip setup stages already recorded as passed in timings-setup.json; retry from the first incomplete or failed stage')
+    parser.add_argument("--state-dir", type=Path,
+                        help="Installation-specific controller state; never share between replacement pairs")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Also accept the assignment spelling from the operator's proposed interface.
+    for index, arg in reversed(list(enumerate(argv))):
+        for name, flag in (("provider_1=", "--provider-1"), ("provider_2=", "--provider-2")):
+            if arg.startswith(name):
+                argv[index:index + 1] = [flag, arg[len(name):]]
+    args = parser.parse_args(argv)
+    from uncloud_terminal import can_prompt
+    interactive = can_prompt(args.non_interactive)
+    if not args.company and interactive:
+        args.company = input('Company name (used as the Trust and inventory slug): ').strip()
+    if not args.company:
+        parser.error('Company name is required for unattended setup')
+    company = company_slug(args.company)
+    for index, attribute in enumerate(('provider_1', 'provider_2'), 1):
+        if getattr(args, attribute) is None and interactive:
+            answer = input(f'Server {index} hosting provider [supplied/google/bare-metal] (default supplied): ').strip()
+            answer = answer or 'supplied'
+            if answer not in ('supplied', 'google', 'bare-metal'):
+                parser.error(f'Unknown provider for server {index}: {answer}')
+            setattr(args, attribute, answer)
+        if getattr(args, attribute) is None:
+            setattr(args, attribute, 'supplied')
+    progress = Progress('setup ' + company)
+    from uncloud_preflight import check_controller
+    with progress.stage('Check local tools and deployment prerequisites'):
+        check_controller(require_google='google' in (args.provider_1, args.provider_2))
+    for name, prompt in (('server_1', 'First Ubuntu server IPv4: '), ('server_2', 'Second Ubuntu server IPv4: ')):
+        if not getattr(args, name) and interactive:
+            setattr(args, name, input(prompt).strip())
+        if not getattr(args, name):
+            parser.error('Two server IPv4 addresses are required for unattended setup')
+    if args.server_1 == args.server_2:
+        raise ValueError("Two distinct machines are required")
+    for address in (args.server_1, args.server_2):
+        ipaddress.IPv4Address(address)
+    global NAMES
+    NAMES = node_names(company)
+    config = json.loads(args.config.read_text()) if args.config else {
+        'deployment': 'dev',
+        'ssh_user': 'ubuntu', 'nodes': {name: {} for name in NAMES}}
+    if getattr(args, 'deployment', None):
+        config['deployment'] = args.deployment
+    NAMES = node_names(company, config.get('nodes'))
+    if args.project:
+        config['google_project'] = args.project
+    if args.boot_disk_size_gb is not None:
+        config['boot_disk_size_gb'] = args.boot_disk_size_gb
+    if config.get('boot_disk_size_gb') is None:
+        config['boot_disk_size_gb'] = 100
+    if not 50 <= int(config['boot_disk_size_gb']) <= 1000:
+        raise ValueError('Google boot disk size must be between 50 and 1000 GiB')
+    for name, zone_arg in zip(NAMES, (args.zone_1, args.zone_2)):
+        if zone_arg:
+            config.setdefault('nodes', {}).setdefault(name, {})['zone'] = zone_arg
+    for name, machine_arg in zip(NAMES, (args.machine_type_1, args.machine_type_2)):
+        if machine_arg:
+            config.setdefault('nodes', {}).setdefault(name, {})['machine_type'] = machine_arg
+    if args.front_url:
+        config['front_url'] = args.front_url
+    if args.backoffice_url:
+        config['backoffice_url'] = args.backoffice_url
+    if args.grafana_url:
+        config['grafana_url'] = args.grafana_url
+    if args.admin_email:
+        config['initial_admin_email'] = args.admin_email
+    supplied_vpn = args.vpn_ips
+    if args.vpn_ip:
+        supplied_vpn = ','.join(([supplied_vpn] if supplied_vpn is not None else config.get('vpn_cidrs', [])) + args.vpn_ip)
+    config['vpn_cidrs'] = monitoring_access(config.get('vpn_cidrs', []),
+                                           interactive=interactive and not args.verify_only and 'vpn_cidrs' not in config, supplied=supplied_vpn)
+    if any(name in config for name in ('cloudflare_api_token', 'CLOUDFLARE_API_TOKEN', 'cloudflare_token')):
+        raise ValueError('Do not put Cloudflare tokens in installation JSON; use the hidden prompt or environment')
+    if any(name in config for name in ('smtp_password', 'smtp_pass', 'CERTLOCKER_SMTP_PASSWORD')):
+        raise ValueError('Do not put SMTP passwords in installation JSON; use the hidden prompt or environment')
+    for name in ('certificate_mode', 'dns_zone', 'acme_email'):
+        if getattr(args, name):
+            config[name] = getattr(args, name)
+    if args.cloudflare_load_balancing is not None:
+        config['cloudflare_load_balancing'] = args.cloudflare_load_balancing
+    elif 'cloudflare_load_balancing' not in config:
+        if interactive:
+            answer = input('Use Cloudflare Load Balancing with sticky browser sessions? [Y/n]: ').strip().lower()
+            config['cloudflare_load_balancing'] = answer not in ('n', 'no')
+        else:
+            config['cloudflare_load_balancing'] = True
+    if type(config.get('cloudflare_load_balancing', False)) is not bool:
+        raise ValueError('cloudflare_load_balancing must be a boolean')
+    monitor_interval = config.get('cloudflare_monitor_interval', 60)
+    if type(monitor_interval) is not int or not 10 <= monitor_interval <= 300:
+        raise ValueError('cloudflare_monitor_interval must be an integer from 10 to 300')
+    registry_mode = config.get('registry_mode', 'ghcr')
+    if registry_mode not in ('ghcr', 'gcp'):
+        raise ValueError('Unknown registry authentication mode')
+    if not args.manifest_file and not args.verify_only:
+        raise ValueError('Supply the release manifest for this installation')
+    if registry_mode == 'gcp':
+        if not config.get('trust_account_id') or not config.get('trust_account_marker_id'):
+            raise ValueError('Customer Google setup requires a dedicated bootstrap Trust account and pre-provisioned marker ID')
+        from uncloud_preflight import controller_swap_disabled
+        if not controller_swap_disabled():
+            raise ValueError('Customer setup must run on a Linux controller with swap disabled')
+        if not config.get('registry_prefix') or not config.get('registry_service_account') or not config.get('kms_key'):
+            raise ValueError('Customer Google setup requires a registry prefix, VM service account and KMS key')
+        if config.get('runtime_backend') != 'gcp-kms':
+            raise ValueError('Customer Google setup requires runtime_backend=gcp-kms')
+    if args.ssh_key:
+        config['ssh_private_key'] = str(args.ssh_key.expanduser().resolve())
+    if args.ssh_user:
+        config['ssh_user'] = args.ssh_user
+    if args.operator_cidr:
+        config['operator_cidrs'] = args.operator_cidr
+    require_deployment(config)
+    if config.get('certificate_mode') != 'customer' or not config.get('vpn_cidrs'):
+        raise ValueError('Customer certificates and an explicit customer VPN allowlist are required')
+    if not config.get('acme_email'):
+        raise ValueError('Provide your ACME contact email in the configuration')
+    if not config.get('ssh_private_key'):
+        if interactive:
+            config['ssh_private_key'] = input('Dedicated SSH private key path: ').strip()
+            if not args.ssh_user:
+                config['ssh_user'] = input('SSH user [ubuntu]: ').strip() or 'ubuntu'
+        if not config.get('ssh_private_key'):
+            parser.error('--ssh-key is required without an installation config')
+    user = config.get('ssh_user', 'ubuntu')
+    logical_key = Path(config['ssh_private_key']).expanduser()
+    if args.state_dir:
+        state_dir = args.state_dir.expanduser().resolve()
+    elif args.config:
+        state_dir = Path.home() / '.local/share/certlocker/cl-deployment' / company
+    else:
+        pair = hashlib.sha256(json.dumps([company, args.server_1, args.server_2, user, str(logical_key)]).encode()).hexdigest()[:20]
+        state_dir = Path.home() / '.local/share/certlocker/uncloud-installations' / pair
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state_dir.chmod(0o700)
+    if runtime_ssh_key(logical_key) == logical_key.absolute():
+        from uncloud_support import ensure_certlocker_token
+        ensure_certlocker_token(interactive=interactive)
+        key_config = dict(config, ssh_user=user, trust_group=args.trust_group or config.get('trust_group') or company)
+        key_access.enter_context(setup_key(company, key_config, state_dir))
+    key = validate_ssh_identity(config)
+    prepare_ssh(state_dir)
+    with progress.stage('Wait for both servers to accept the provisioning key and passwordless sudo'):
+        for address in (args.server_1, args.server_2):
+            wait_for_ssh(key, address, user=user)
+    if not config.get('operator_cidrs'):
+        operators = set()
+        for address in (args.server_1, args.server_2):
+            connection = ssh(key, address, 'printf "%s\\n" "$SSH_CONNECTION"', user=user).split()
+            if not connection or ipaddress.ip_address(connection[0]).version != 4:
+                raise ValueError('Could not discover operator IPv4; supply --operator-cidr explicitly')
+            operators.add(connection[0] + '/32')
+        config['operator_cidrs'] = sorted(operators)
+    config['operator_cidrs'] = with_updater(config['operator_cidrs'])
+    google_servers = [(name, provider, zone_arg) for name, provider, zone_arg in
+                      zip(NAMES, (args.provider_1, args.provider_2), (args.zone_1, args.zone_2))
+                      if provider == 'google']
+    if google_servers:
+        project = config.get('google_project')
+        if not project and interactive:
+            project = input('Google Cloud project ID: ').strip()
+            config['google_project'] = project
+        if not project:
+            raise ValueError('Google-hosted servers require --project or google_project in the setup config')
+        available = json.loads(run(['gcloud', 'compute', 'zones', 'list', '--project', project,
+                                    '--format=json(name,status)', '--quiet'], capture=True))
+        zones = sorted(item['name'] for item in available if item.get('status') == 'UP')
+        if not zones:
+            raise ValueError('No active Google Compute zones are available in the selected project')
+        print('Available Google zones in this project: ' + ', '.join(zones), flush=True)
+        print('Examples: europe-west1-b = St. Ghislain, Belgium; '
+              'europe-west4-a = Eemshaven, Netherlands; '
+              'us-central1-a = Council Bluffs, Iowa, USA.', flush=True)
+        print('Each zone name ends in a failure-domain letter. Full locations: '
+              'https://docs.cloud.google.com/compute/docs/regions-zones', flush=True)
+        for name, _, zone_arg in google_servers:
+            settings = config.setdefault('nodes', {}).setdefault(name, {})
+            zone = zone_arg or settings.get('zone')
+            if interactive:
+                zone = input(f'Google zone for {name}' + (f' [{zone}]' if zone else '') + ': ').strip() or zone
+            if not zone:
+                raise ValueError(f'Supply a Google zone for {name} with --zone-1/--zone-2 or setup config')
+            if zone not in zones:
+                raise ValueError(f'{name}: Google zone {zone} is not active in project {project}')
+            settings['zone'] = zone
+        for name, provider, _ in zip(NAMES, (args.provider_1, args.provider_2), (args.zone_1, args.zone_2)):
+            if provider != 'google':
+                continue
+            settings = config.setdefault('nodes', {}).setdefault(name, {})
+            default_type = settings.get('machine_type', 'e2-standard-2')
+            supplied = args.machine_type_1 if name == NAMES[0] else args.machine_type_2
+            machine_type = supplied or default_type
+            if interactive and not supplied:
+                machine_type = input(f'Google VM type for {name} [{default_type}]: ').strip() or default_type
+            if not re.fullmatch(r'[a-z][a-z0-9-]+', machine_type):
+                raise ValueError(f'{name}: invalid Google machine type {machine_type}')
+            details = json.loads(run(['gcloud', 'compute', 'machine-types', 'describe', machine_type,
+                                      '--project', config['google_project'], '--zone', settings['zone'],
+                                      '--format=json', '--quiet'], capture=True))
+            if details.get('guestCpus', 0) < 2 or details.get('memoryMb', 0) < 8192:
+                raise ValueError(f'{name}: {machine_type} must provide at least 2 vCPUs and 8 GiB RAM')
+            settings['machine_type'] = machine_type
+        if args.boot_disk_size_gb is None and interactive:
+            current_disk = int(config.get('boot_disk_size_gb', 100))
+            answer = input(f'Google boot disk size in GiB [{current_disk}]: ').strip()
+            config['boot_disk_size_gb'] = int(answer) if answer else current_disk
+            if not 50 <= config['boot_disk_size_gb'] <= 1000:
+                raise ValueError('Google boot disk size must be between 50 and 1000 GiB')
+        selected_zones = [config['nodes'][name]['zone'] for name, _, _ in google_servers]
+        if len(selected_zones) == 2 and selected_zones[0] == selected_zones[1]:
+            raise ValueError('The two Google servers must use different zones for host failure isolation')
+    validate_config(config)
+    # Pin this installation directory to its original machines and identities.
+    binding = state_dir / "installation.json"
+    identity = {'company': company, "addresses": [args.server_1, args.server_2],
+                "providers": [args.provider_1, args.provider_2],
+                "key_path": str(Path(config["ssh_private_key"]).expanduser()), "config": config}
+    if binding.exists() and json.loads(binding.read_text()) != identity:
+        raise ValueError("Installation identity differs; do not reuse state or credentials for another pair")
+    hosts = dict(zip(NAMES, [
+        resolve_node(args.provider_1, args.server_1, NAMES[0], config),
+        resolve_node(args.provider_2, args.server_2, NAMES[1], config)]))
+    company_dir = inventory_directory(company)
+    company_marker = company_dir / '.setup.json'
+    company_identity = {'schema_version': 1, 'company': company, 'state_dir': str(state_dir),
+                        'addresses': [args.server_1, args.server_2], 'ssh_user': user,
+                        'ssh_key_path': str(Path(config['ssh_private_key']).expanduser())}
+    if company_dir.exists() and not company_marker.exists():
+        raise ValueError('Existing inventory is not owned by setup-ha; refusing to overwrite it')
+    if company_marker.exists():
+        previous = json.loads(company_marker.read_text())
+        if previous != company_identity and not args.replace_inventory:
+            raise ValueError('Company inventory belongs to another pair; explicit --replace-inventory required')
+    trust = None
+    variables = []
+    release = None
+    certificate_settings = None
+    if args.until in ('database', 'apps'):
+        print('[setup] Read company settings from Trust; collect any missing certificate and mail choices.', flush=True)
+        from uncloud_support import ensure_certlocker_token
+        ensure_certlocker_token(interactive=interactive)
+        trust = Trust(group=args.trust_group or config.get('trust_group') or company, account_id=config.get('trust_account_id'))
+        trust.check_authorization(company, interactive=interactive)
+        if registry_mode == 'gcp':
+            trust.bind_account(company, config['trust_account_id'], config['trust_account_marker_id'])
+        if args.until == 'apps' and not args.verify_only:
+            from uncloud_enrollment import enroll
+            certificate_settings = enroll(company, trust, config, non_interactive=args.non_interactive)
+            if certificate_settings['certificate_mode'] == 'customer':
+                # A new company's hostnames must belong to its own DNS zone.
+                existing_names = trust.get(trust_name(company, 'vault_certlocker_ingress_settings'))
+                if existing_names is MISSING:
+                    zone = certificate_settings['dns_zone']
+                    front_default = 'https://' + company + '.' + zone
+                    backoffice_default = 'https://backoffice-' + company + '.' + zone
+                    grafana_default = 'https://grafana-cl-' + company + '.' + zone
+                    front_url = config.get('front_url') or front_default
+                    backoffice_url = config.get('backoffice_url') or backoffice_default
+                    grafana_url = config.get('grafana_url') or grafana_default
+                    if interactive and not config.get('front_url'):
+                        front_url = input('Front-office URL [' + front_default + ']: ').strip() or front_default
+                    if interactive and not config.get('backoffice_url'):
+                        backoffice_url = input('Backoffice URL [' + backoffice_default + ']: ').strip() or backoffice_default
+                    names = {'hostname': ui_hostname(front_url, zone),
+                             'backoffice_hostname': ui_hostname(backoffice_url, zone),
+                             'grafana_hostname': ui_hostname(grafana_url, zone)}
+                    trust.ensure(company, 'vault_certlocker_ingress_settings', lambda: names)
+                elif (args.front_url or args.backoffice_url or config.get('front_url') or
+                      config.get('backoffice_url') or args.grafana_url or config.get('grafana_url')):
+                    zone = certificate_settings['dns_zone']
+                    requested = dict(existing_names)
+                    front_url = args.front_url or config.get('front_url')
+                    backoffice_url = args.backoffice_url or config.get('backoffice_url')
+                    grafana_url = args.grafana_url or config.get('grafana_url')
+                    if front_url:
+                        requested['hostname'] = ui_hostname(front_url, zone)
+                    if backoffice_url:
+                        requested['backoffice_hostname'] = ui_hostname(backoffice_url, zone)
+                    if grafana_url:
+                        requested['grafana_hostname'] = ui_hostname(grafana_url, zone)
+                    elif 'grafana_hostname' not in requested:
+                        requested['grafana_hostname'] = 'grafana-cl.' + requested['hostname'].split('.', 1)[1]
+                    if 'grafana_hostname' not in existing_names:
+                        from uncloud_support import replace_configuration
+                        existing_names = replace_configuration(company, trust, 'vault_certlocker_ingress_settings', requested)
+                    if requested != existing_names:
+                        raise ValueError('Requested UI URLs differ from saved company Trust settings; update the enrollment explicitly')
+        if args.until == 'apps' and config.get('cloudflare_load_balancing'):
+            # Fail before issuing a production certificate or changing hosts.
+            from uncloud_cloudflare import Cloudflare, check_access
+            from uncloud_certificates import cloudflare_preflight
+            zone = config.get('dns_zone') or (certificate_settings or {}).get('dns_zone')
+            if not zone:
+                saved_certificate = trust.get(trust_name(company, 'vault_certlocker_certificate_settings'))
+                zone = saved_certificate.get('dns_zone') if isinstance(saved_certificate, dict) else None
+            if not zone:
+                raise ValueError('Cloudflare health routing requires --dns-zone or dns_zone in installation config')
+            cf_token, cf_zone = cloudflare_preflight(company, trust, zone)
+            check_access(Cloudflare(cf_token), cf_zone, zone)
+        if args.until == 'apps' and not args.verify_only and (args.reuse_issued_certificate or config.get('reuse_issued_certificate')):
+            require_deployment(config)
+            if not certificate_settings or certificate_settings['certificate_mode'] != 'customer':
+                raise ValueError('Explicit certificate import with local renewal requires customer certificate mode')
+            from uncloud_certificates import validate_reuse_source
+            validate_reuse_source(company, trust)
+        occupied = [ssh(key, host['ansible_host'],
+                       'sudo -n true && if sudo -n test -e /var/lib/certlocker-uncloud/identity.json; then echo existing; '
+                       'elif command -v docker >/dev/null 2>&1 && sudo -n docker volume inspect certlocker-uncloud-db_postgres_repmgr_data >/dev/null 2>&1; then echo existing; '
+                       'else echo empty; fi', user=user).strip() for host in hosts.values()]
+        variables = initialize_environment(company, trust, allow_create=not args.verify_only and all(value == 'empty' for value in occupied),
+                                  master_key=read_master_key(args.master_key_file.expanduser()) if args.master_key_file else None,
+                                  registry_mode=registry_mode, ghcr_secret_name=config.get('ghcr_secret_name'),
+                                  ghcr_username=config.get('ghcr_username', 'sean-certlocker'))
+        if args.until == 'apps':
+            admin_email = config.get('initial_admin_email')
+            if not admin_email:
+                saved_admin_email = trust.get(trust_name(company, 'vault_certlocker_initial_admin_email'))
+                if saved_admin_email is not MISSING:
+                    admin_email = saved_admin_email
+            if not admin_email and interactive:
+                admin_email = input('Email address for the company superuser: ').strip()
+            if not isinstance(admin_email, str) or not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', admin_email):
+                raise ValueError('A valid --admin-email is required for the company superuser')
+            admin_email = admin_email.strip().lower()
+            admin_secret = 'vault_certlocker_initial_admin_email'
+            stored_email = trust.ensure(company, admin_secret, lambda: admin_email,
+                                        allow_create=not args.verify_only)
+            if stored_email != admin_email:
+                raise ValueError('Company superuser email differs from the value already saved in company Trust')
+            config['initial_admin_email'] = admin_email
+            default_domain = admin_email.rsplit('@', 1)[1].lower()
+            saved_account_domain = trust.get(trust_name(company, 'vault_certlocker_company_account_domain'))
+            account_domain = args.account_domain or config.get('account_domain')
+            if not account_domain and saved_account_domain is not MISSING:
+                account_domain = saved_account_domain
+            if not account_domain and interactive:
+                account_domain = input('Company account domain [' + default_domain + ']: ').strip() or default_domain
+            account_domain = account_domain or default_domain
+            if not re.fullmatch(r'(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}', account_domain):
+                raise ValueError('A valid --account-domain is required for the company superuser account')
+            saved_domain = trust.ensure(company, 'vault_certlocker_company_account_domain', lambda: account_domain,
+                                        allow_create=not args.verify_only)
+            if saved_domain != account_domain:
+                raise ValueError('Company account domain differs from the value already saved in company Trust')
+            config['account_domain'] = account_domain
+            display_name = args.admin_display_name or config.get('admin_display_name')
+            if not display_name and interactive:
+                display_name = input('Superuser display name [' + admin_email.split('@', 1)[0] + ']: ').strip()
+            config['admin_display_name'] = display_name or admin_email.split('@', 1)[0]
+            variables.append(admin_secret)
+        if args.until == 'apps' and not args.verify_only:
+            from uncloud_smtp import enroll_smtp
+            enroll_smtp(company, trust, config, non_interactive=args.non_interactive)
+    if args.until == 'apps':
+        if args.verify_only:
+            release = json.loads((company_dir / 'release.json').read_text())
+        else:
+            release, metadata = (bundled_release_manifest(args.manifest_file, args.release, config.get('registry_prefix'))
+                                 if args.manifest_file else release_manifest(args.release))
+            print('Selected immutable GitHub release:', metadata['tag'], metadata['sha256'], flush=True)
+        for host in hosts.values():
+            memory = int(ssh(key, host['ansible_host'], "awk '/MemTotal:/ {print $2}' /proc/meminfo", user=user))
+            if memory < 7_500 * 1024:
+                raise ValueError('Full application setup needs an 8 GiB VM; select e2-standard-2 or larger')
+    if args.provider_1 != args.provider_2:
+        for name, provider in zip(NAMES, [args.provider_1, args.provider_2]):
+            if provider == 'google' and ipaddress.ip_address(hosts[name]['uncloud_private_ip']).is_private:
+                raise ValueError("Mixed providers require an explicit reachable Google wireguard_endpoint and peer-only cloud firewall rules")
+    private_write(binding, json.dumps(identity, indent=2))
+    inventory = {"all": {"children": {"uncloud": {"hosts": hosts, "vars": {
+        "ansible_user": user, "ansible_python_interpreter": "/usr/bin/python3",
+        'ansible_remote_tmp': '/run/certlocker-' + company + '-ansible',
+        "uncloud_deployment": require_deployment(config),
+        'uncloud_company': company,
+        'uncloud_updater_cidrs': list(CERTLOCKER_UPDATER_CIDRS),
+        'uncloud_trust_group': args.trust_group or config.get('trust_group') or company,
+        'uncloud_trust_account_id': GatewayRoutes(config.get('trust_account_id')).account_id,
+        'uncloud_trust_account_marker_id': config.get('trust_account_marker_id'),
+        'uncloud_registry_mode': registry_mode,
+        'uncloud_registry_prefix': config.get('registry_prefix', ''),
+        'uncloud_registry_host': config.get('registry_prefix', '').split('/')[0],
+        'uncloud_registry_service_account': config.get('registry_service_account', ''),
+        'uncloud_runtime_backend': config.get('runtime_backend', 'host'),
+        'uncloud_kms_key': config.get('kms_key', ''),
+        'uncloud_with_apps': args.until == 'apps',
+        "uncloud_operator_cidrs": config["operator_cidrs"],
+        "uncloud_http_rate_limit": config.get("http_rate_limit", 400),
+        "uncloud_vpn_cidrs": config["vpn_cidrs"]}}}}}
+    inventory_path = state_dir / "inventory.json"
+
+    def write_inventory():
+        private_write(inventory_path, json.dumps(inventory, indent=2))
+        private_write(company_dir / 'hosts.json', json.dumps(inventory, indent=2))
+        private_write(company_marker, json.dumps(company_identity, indent=2))
+        if trust:
+            write_trust_references(company, company_dir, variables, trust.api_url)
+        if release:
+            private_write(company_dir / 'release.json', json.dumps(release, indent=2))
+
+    runtime_values = {}
+    def execute_play(name):
+        command = ["ansible-playbook", "-i", company_dir / 'hosts.json', ROOT / "playbooks" / name,
+                   "--private-key", key]
+        if trust and (name.startswith('uncloud_apps') or name.startswith('uncloud_database') or name.startswith('uncloud_monitoring') or name.startswith('uncloud_ingress') or name.startswith('uncloud_ha_') or name.startswith('uncloud_certificate')):
+            # Later stages add Trust records (notably the database identity)
+            # after the application network stage has populated this snapshot.
+            missing = [variable for variable in variables if variable not in runtime_values]
+            if missing:
+                runtime_values.update(resolve_environment(company, trust, missing))
+            run_ansible(command, runtime_values, require_no_swap=registry_mode == 'gcp')
+        else:
+            run(command)
+
+    stage_timings = []
+    continue_prefix = [] if args.verify_only else load_continue_prefix(state_dir, args.continue_from_timings)
+    continue_index = 0
+    if continue_prefix:
+        print(
+            f'Continuing setup: skipping {len(continue_prefix)} completed stage(s); '
+            f'resuming at {timing_stage_key(continue_prefix[-1])!r} boundary',
+            flush=True,
+        )
+
+    def write_stage_timings():
+        timing_path = state_dir / ('timings-verify.json' if args.verify_only else 'timings-setup.json')
+        private_write(timing_path, json.dumps({'company': company, 'playbooks': stage_timings}, indent=2) + '\n')
+
+    def consume_continued_stage(key):
+        nonlocal continue_index
+        if continue_index >= len(continue_prefix):
+            return None
+        expected = timing_stage_key(continue_prefix[continue_index])
+        if expected != key:
+            # Sequence diverged from the saved timings; re-run from here onward.
+            continue_index = len(continue_prefix)
+            return None
+        row = continue_prefix[continue_index]
+        continue_index += 1
+        stage_timings.append(row)
+        write_stage_timings()
+        label = row.get('stage') or row.get('playbook')
+        print(f'Skipping completed stage: {label} ({row.get("seconds", 0)}s recorded)', flush=True)
+        return row
+
+    def play(name):
+        if consume_continued_stage(name):
+            return
+        started = time.monotonic()
+        status = 'failed'
+        try:
+            with progress.stage(PLAY_LABELS.get(name, 'Run installation verification')):
+                execute_play(name)
+            status = 'passed'
+        finally:
+            elapsed = round(time.monotonic() - started, 3)
+            stage_timings.append({'playbook': name, 'status': status, 'seconds': elapsed})
+            write_stage_timings()
+            print(f'Timing: {name}: {elapsed:.3f}s ({status})', flush=True)
+
+    write_inventory()
+    if not args.verify_only:
+        print("Stage 1: baseline and hardening", flush=True)
+        play("uncloud_bootstrap.yml")
+    print("Gate 1: independent host verification", flush=True)
+    play("uncloud_host_verify.yml")
+    if args.until == "harden":
+        progress.finish('passed')
+        return
+
+    uc_config = state_dir / "uncloud.yaml"
+    context = 'certlocker-' + company
+    common = ["--uncloud-config", str(uc_config), "--context", context]
+    needs_init = prepare_uncloud_config(
+        uc_config, context, create=not args.verify_only, ssh_key=key,
+        targets={f'{user}@{args.server_1}', f'{user}@{args.server_2}'})
+    if args.verify_only and needs_init:
+        raise ValueError('Company mesh context is not initialized')
+    with progress.stage('Connect both servers through the private mesh'):
+        if not args.verify_only:
+            print("Stage 2: private mesh (no Caddy or public DNS)", flush=True)
+            if needs_init:
+                run(["uc", "machine", "init", f"{user}@{args.server_1}", "--name", NAMES[0],
+                     *common, "--ssh-key", key, "--version", VERSION, "--no-caddy", "--no-dns",
+                     "--network", "10.210.0.0/16", "--wg-mtu", "1380", "--wg-endpoint",
+                     hosts[NAMES[0]]["uncloud_private_ip"] + ":51820"])
+            # Use a read-only membership check. Never infer permission to reset a node.
+            membership = json.loads(run(["uc", "machine", "ls", "-o", "json", *common], capture=True))
+            members = {node['Name'] for node in membership}
+            if NAMES[0] not in members or not members.issubset(set(NAMES)):
+                raise ValueError("Existing mesh context does not contain the expected first machine")
+            if NAMES[1] not in members:
+                run(["uc", "machine", "add", f"{user}@{args.server_2}", "--name", NAMES[1],
+                     *common, "--ssh-key", key, "--version", VERSION, "--no-caddy",
+                     "--wg-mtu", "1380", "--wg-endpoint", hosts[NAMES[1]]["uncloud_private_ip"] + ":51820"])
+        for attempt in range(20):
+            membership = json.loads(run(["uc", "machine", "ls", "-o", "json", *common], capture=True))
+            if {node['Name'] for node in membership} != set(NAMES):
+                raise ValueError("Mesh membership differs from the intended pair")
+            if all(node['State'] == 'Up' and node['DaemonVersion'] == VERSION for node in membership):
+                break
+            time.sleep(3)
+        else:
+            raise ValueError("Both machines must be Up at the pinned mesh version before database installation")
+        run(["uc", "machine", "ls", *common])
+        for name, host in hosts.items():
+            addresses = json.loads(ssh(key, host["ansible_host"], "ip -j -4 address show", user=user))
+            mesh = {address["local"] for interface in addresses for address in interface["addr_info"]
+                    if address.get("prefixlen") == 24 and address["local"].endswith('.1') and
+                    ipaddress.ip_address(address["local"]) in ipaddress.ip_network("10.210.0.0/16")}
+            if len(mesh) != 1:
+                raise ValueError(f"{name}: expected exactly one mesh bridge gateway /24")
+            host["uncloud_mesh_ip"] = mesh.pop()
+        if hosts[NAMES[0]]["uncloud_mesh_ip"] == hosts[NAMES[1]]["uncloud_mesh_ip"]:
+            raise ValueError("Mesh machine addresses must differ")
+        write_inventory()
+    play("uncloud_network_verify.yml")
+    if args.until == "network":
+        progress.finish('passed')
+        return
+    if not args.verify_only:
+        from uncloud_host_access import save_host_access
+        access = save_host_access(company, trust, key, user, hosts, ssh, config)
+        private_write(company_dir / 'host-access.json', json.dumps(access, indent=2) + '\n')
+    if not args.verify_only and args.until == 'apps':
+        play('uncloud_apps_network.yml')
+    variables.append(initialize_database_identity(company, trust,
+                     {name: host['uncloud_mesh_ip'] for name, host in hosts.items()},
+                     allow_create=not args.verify_only and all(value == 'empty' for value in occupied),
+                     allow_reissue=not args.verify_only and args.replace_inventory and
+                                   all(value == 'empty' for value in occupied)))
+    write_inventory()
+    if not args.verify_only:
+        print("Stage 3: fresh PostgreSQL/repmgr and Pgpool on private addresses", flush=True)
+        play("uncloud_database.yml")
+    play("uncloud_database_verify.yml")
+    if args.until == 'database':
+        print('Company database setup and verification passed.', flush=True)
+        progress.finish('passed')
+        return
+    if not args.verify_only:
+        print('Stage 4: install the pinned GitHub application release using Trust variables', flush=True)
+        if registry_mode == 'gcp':
+            play('uncloud_registry_auth.yml')
+        play('uncloud_apps_router_proxy.yml')
+        play('uncloud_apps.yml')
+        play('uncloud_runtime_secrets.yml')
+        play('uncloud_apps_failover.yml')
+    play('uncloud_apps_verify.yml')
+    if not args.verify_only:
+        with progress.stage('Create or verify the company superuser, then add both hosts and its SSH key'):
+            run([ROOT / 'scripts/seed-ha-company-account', company,
+                 '--account-domain', config['account_domain'],
+                 '--display-name', config['admin_display_name'],
+                 '--admin-email', config['initial_admin_email']])
+    if not args.verify_only:
+        runtime_values.update(prepare_ingress(company, trust, certificate=False))
+        play('uncloud_monitoring.yml')
+        automatic_certificate = certificate_settings and certificate_settings['certificate_mode'] == 'customer'
+        runtime_values.update(prepare_ingress(company, trust, certificate=not automatic_certificate))
+        from uncloud_certificates import identity as certificate_identity
+        runtime_values['vault_certlocker_certificate_deploy_public_key'] = certificate_identity(company, trust)['ssh_public_key']
+        play('uncloud_certificate_automation.yml')
+        runtime_values['uncloud_ingress_bootstrap_only'] = bool(automatic_certificate)
+        play('uncloud_ingress.yml')
+        play('uncloud_runtime_secrets.yml')
+        if automatic_certificate:
+            reuse_certificate = args.reuse_issued_certificate or config.get('reuse_issued_certificate', False)
+            certificate_key = ('certificate-reuse-and-both-origin-automation' if reuse_certificate else
+                               'certificate-issuance-and-both-origin-automation')
+            if not consume_continued_stage(certificate_key):
+                started = time.monotonic()
+                certificate_status = 'failed'
+                try:
+                    label = ('Import the valid company certificate, deploy it through Trust, and schedule renewal' if reuse_certificate else
+                             'Request the UI certificate, wait for issuance, and activate it on both HAProxies')
+                    with progress.stage(label):
+                        run([ROOT / 'scripts/test-ha-certificates', company,
+                             '--reuse-issued' if reuse_certificate else '--issue-new', '--ensure',
+                             '--acme-email', certificate_settings['acme_email'],
+                             '--dns-zone', certificate_settings['dns_zone']])
+                    certificate_status = 'passed'
+                finally:
+                    stage_timings.append({'stage': certificate_key, 'status': certificate_status,
+                                          'seconds': round(time.monotonic() - started, 3)})
+                    write_stage_timings()
+    else:
+        runtime_values.update(prepare_ingress(company, trust, allow_create=False, certificate=False))
+    play('uncloud_ha_verify.yml')
+    if config.get('cloudflare_load_balancing'):
+        if not consume_continued_stage('cloudflare-health-routing'):
+            started = time.monotonic()
+            routing_status = 'failed'
+            try:
+                with progress.stage('Verify both origins and configure cookie-sticky Cloudflare Load Balancing'):
+                    run([ROOT / 'scripts/configure-ha-cloudflare', company, '--zone', zone,
+                         '--interval', str(config.get('cloudflare_monitor_interval', 60)),
+                         '--verify' if args.verify_only else '--apply'])
+                routing_status = 'passed'
+            finally:
+                stage_timings.append({'stage': 'cloudflare-health-routing', 'status': routing_status,
+                                      'seconds': round(time.monotonic() - started, 3)})
+                write_stage_timings()
+    if not args.verify_only and trust:
+        saved_certificate = trust.get(trust_name(company, 'vault_certlocker_certificate_settings'))
+        grafana_zone = ((certificate_settings or {}).get('dns_zone') or
+                        (saved_certificate.get('dns_zone') if isinstance(saved_certificate, dict) else None))
+        if grafana_zone:
+            with progress.stage('Publish the DNS-only Grafana name for VPN-restricted monitoring access'):
+                run([ROOT / 'scripts/configure-ha-monitoring-dns', company, '--zone', grafana_zone])
+    print('Company setup and application release verification passed.', flush=True)
+    if not args.verify_only and trust:
+        ingress = trust.get(trust_name(company, 'vault_certlocker_ingress_settings'))
+        admin_email = config.get('initial_admin_email')
+        if isinstance(ingress, dict) and ingress.get('hostname') and admin_email:
+            print('Share the first-login details securely with ' +
+                  admin_email + ' at https://' + ingress['hostname'] +
+                  '. Use the password set for this account; it is not saved locally. The setup CLI does not send email.',
+                  flush=True)
+    progress.finish('passed')
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, KeyError, OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f"Installation stopped: {error}", file=sys.stderr)
+        if Progress.current is not None:
+            Progress.current.finish('stopped')
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print('Installation interrupted.', file=sys.stderr)
+        if Progress.current is not None:
+            Progress.current.finish('stopped')
+        sys.exit(130)

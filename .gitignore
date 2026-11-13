@@ -1,0 +1,21 @@
+# Customer configuration and generated operational state never belong in Git.
+/local/
+/inventory/
+/uncloud/environments/
+*.runtime.json
+company.json
+release.json
+release.json.sha256
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.tfstate*
+.terraform/
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
