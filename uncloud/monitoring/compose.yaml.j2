@@ -1,0 +1,135 @@
+name: certlocker-{{ uncloud_company }}-monitoring
+x-common: &common
+  restart: unless-stopped
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  logging:
+    driver: local
+    options: {max-size: '20m', max-file: '5'}
+services:
+  node-exporter:
+    <<: *common
+    image: {{ uncloud_monitoring_images['node-exporter'] }}
+    container_name: certlocker-node-exporter
+    network_mode: host
+    command:
+      - --web.listen-address={{ uncloud_mesh_ip }}:9100
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+    volumes: [/proc:/host/proc:ro, /sys:/host/sys:ro, /:/rootfs:ro]
+    mem_limit: 128m
+  cadvisor:
+    image: {{ uncloud_monitoring_images.cadvisor }}
+    container_name: certlocker-cadvisor
+    restart: unless-stopped
+    privileged: true
+    network_mode: host
+    command: [--listen_ip={{ uncloud_mesh_ip }}, --port=8080, --docker_only=true, --store_container_labels=false, --disable_metrics=disk]
+    healthcheck:
+      test: [CMD, wget, --quiet, --tries=1, --spider, 'http://{{ uncloud_mesh_ip }}:8080/healthz']
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    devices: [/dev/kmsg]
+    volumes: [/:/rootfs:ro, /var/run:/var/run:ro, /sys:/sys:ro, /var/lib/docker:/var/lib/docker:ro]
+    mem_limit: 768m
+  postgres-exporter:
+    <<: *common
+    image: {{ uncloud_monitoring_images['postgres-exporter'] }}
+    container_name: certlocker-postgres-exporter
+    network_mode: host
+    command: [--web.listen-address={{ uncloud_mesh_ip }}:9187]
+    environment:
+      DATA_SOURCE_URI: '{{ uncloud_mesh_ip }}:5432/certlocker?sslmode=require'
+      DATA_SOURCE_USER: postgres
+      DATA_SOURCE_PASS_FILE: /run/secrets/postgres
+    volumes: ["{{ monitoring_runtime }}/postgres:/run/secrets/postgres:ro"]
+    mem_limit: 128m
+{% if uncloud_google_chat_alerts_enabled | default(false) %}
+  google-chat-alerts:
+    <<: *common
+    image: {{ uncloud_monitoring_images['google-chat-alerts'] }}
+    container_name: certlocker-google-chat-alerts
+    network_mode: host
+    command: [python, /app/google_chat_webhook.py]
+    environment:
+      GOOGLE_CHAT_WEBHOOK_FILE: /run/secrets/google_chat_webhook_url
+      LOKI_URL: http://{{ uncloud_mesh_ip }}:3100
+      LISTEN_HOST: 127.0.0.1
+      LISTEN_PORT: '9094'
+    volumes:
+      - ./google_chat_webhook.py:/app/google_chat_webhook.py:ro
+      - "{{ monitoring_runtime }}/google_chat_webhook_url:/run/secrets/google_chat_webhook_url:ro"
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9094/health', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    mem_limit: 64m
+{% endif %}
+  alertmanager:
+    <<: *common
+    image: {{ uncloud_monitoring_images.alertmanager }}
+    container_name: certlocker-alertmanager
+    network_mode: host
+    # Disable AM cluster gossip (default :9094) so google-chat-alerts can bind 127.0.0.1:9094.
+    command: [--config.file=/etc/alertmanager/alertmanager.yml, --storage.path=/alertmanager, --web.listen-address=127.0.0.1:9093, --cluster.listen-address=]
+    volumes: [./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro, alertmanager_data:/alertmanager]
+    mem_limit: 256m
+  prometheus:
+    <<: *common
+    image: {{ uncloud_monitoring_images.prometheus }}
+    container_name: certlocker-prometheus
+    network_mode: host
+    command: [--config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.path=/prometheus, --storage.tsdb.retention.time=30d, --storage.tsdb.retention.size=4GB, --web.listen-address={{ uncloud_mesh_ip }}:9090, --web.external-url=https://{{ uncloud_ingress_settings.grafana_hostname }}/prometheus/, --web.route-prefix=/prometheus/]
+    volumes: [./prometheus.yml:/etc/prometheus/prometheus.yml:ro, ./rules.yml:/etc/prometheus/rules.yml:ro, prometheus_data:/prometheus]
+    mem_limit: 1024m
+  loki:
+    <<: *common
+    image: {{ uncloud_monitoring_images.loki }}
+    container_name: certlocker-loki
+    network_mode: host
+    command: [--config.file=/etc/loki/local-config.yaml]
+    volumes: [./loki-config.yaml:/etc/loki/local-config.yaml:ro, loki_data:/loki]
+    # The pinned Loki image has no shell or wget. Deployment checks /ready
+    # externally, and Prometheus continuously scrapes its metrics endpoint.
+    mem_limit: 512m
+  alloy:
+    <<: *common
+    image: {{ uncloud_monitoring_images.alloy }}
+    container_name: certlocker-alloy
+    # Root UID opens the Docker socket; Alloy's group can write its 0770 data
+    # directories even with every Linux capability dropped.
+    user: '0:473'
+    network_mode: host
+    command: [run, --disable-reporting, --storage.path=/var/lib/alloy/data, --server.http.listen-addr=127.0.0.1:12345, /etc/alloy/config.alloy]
+    volumes: [/var/run/docker.sock:/var/run/docker.sock:ro, ./alloy.config.alloy:/etc/alloy/config.alloy:ro, alloy_data:/var/lib/alloy/data]
+    healthcheck:
+      test: [CMD, /bin/alloy, --version]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    mem_limit: 256m
+  grafana:
+    <<: *common
+    image: {{ uncloud_monitoring_images.grafana }}
+    container_name: certlocker-grafana
+    network_mode: host
+    environment:
+      GF_SERVER_HTTP_ADDR: {{ uncloud_mesh_ip }}
+      GF_SERVER_HTTP_PORT: '3001'
+      GF_SERVER_DOMAIN: {{ uncloud_ingress_settings.grafana_hostname }}
+      GF_SERVER_ROOT_URL: https://{{ uncloud_ingress_settings.grafana_hostname }}/
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+    volumes: [grafana_data:/var/lib/grafana, "{{ monitoring_runtime }}/grafana_admin_password:/run/secrets/grafana_admin_password:ro", ./datasources.yml:/etc/grafana/provisioning/datasources/default.yml:ro]
+    mem_limit: 512m
+volumes:
+  prometheus_data: {}
+  loki_data: {}
+  alloy_data: {}
+  grafana_data: {}
+  alertmanager_data: {}

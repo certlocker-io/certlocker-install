@@ -1,0 +1,30 @@
+---
+- name: Refresh mail only on the drained DataService node
+  delegate_to: "{{ release_node }}"
+  block:
+    - name: Verify SMTP destination is memory-backed
+      ansible.builtin.command: "findmnt -n -o FSTYPE -T /run/certlocker/{{ uncloud_company }}"
+      register: smtp_filesystem
+      changed_when: false
+      failed_when: smtp_filesystem.stdout | trim != 'tmpfs'
+
+    - name: Require a company password when mail is enabled
+      ansible.builtin.assert:
+        that:
+          - not (vault_certlocker_application_settings.smtp_enabled | bool) or vault_certlocker_dataservice_smtp_pass | length > 0
+      no_log: true
+
+    - name: Materialize the company mail password only in tmpfs
+      ansible.builtin.copy:
+        dest: "/run/certlocker/{{ uncloud_company }}/smtp"
+        content: "{{ vault_certlocker_dataservice_smtp_pass }}"
+        mode: '0400'
+      no_log: true
+
+    - name: Refresh DataService mail configuration and seal the encrypted boot cache
+      ansible.builtin.script:
+        cmd: >-
+          ops/files/uncloud_smtp_runtime.py --company {{ uncloud_company }}
+          --settings {{ vault_certlocker_application_settings | to_json | quote }}
+        executable: /usr/bin/python3
+      no_log: true

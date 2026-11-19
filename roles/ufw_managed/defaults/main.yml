@@ -1,0 +1,15 @@
+---
+# Enable after rules are correct and you still have SSH/console access.
+ufw_managed_enabled: false
+
+# When true, set IPV6=no in /etc/default/ufw (no IPv6 UFW rules; pair with host sysctl if you disable IPv6 stack).
+ufw_managed_disable_ipv6: false
+
+# Delete legacy 7000/8000/9000/tcp ALLOW Anywhere (IPv4) numbered rules not represented in ufw_managed_rules.
+ufw_managed_cleanup_high_ports_anywhere: true
+
+# Optional: [{ direction: incoming, policy: deny }, { direction: outgoing, policy: allow }]
+ufw_managed_defaults: []
+
+# Paste your desired rules here (see community.general.ufw parameters).
+ufw_managed_rules: []

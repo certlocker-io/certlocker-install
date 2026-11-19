@@ -1,0 +1,118 @@
+---
+- name: Detect installed application ownership
+  ansible.builtin.command:
+    cmd: "grep -c '^HA_API_SINGLE_OWNER=1$' /opt/certlocker/{{ uncloud_company }}/uncloud-apps/.env"
+  delegate_to: "{{ release_node }}"
+  register: single_owner_mode
+  changed_when: false
+  failed_when: single_owner_mode.rc not in [0, 1]
+
+- name: Hold this node out of application ownership during its release
+  ansible.builtin.copy:
+    dest: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps/.api-owner-maintenance"
+    content: "Planned release: peer must own the interactive APIs.\n"
+    mode: '0600'
+  delegate_to: "{{ release_node }}"
+  when: single_owner_mode.stdout | trim == '1'
+
+- name: Wait for the supervisor to stop local APIs before any image changes
+  ansible.builtin.command:
+    cmd: "docker inspect --format '{{ '{{.State.Running}}' }}' certlocker-edge certlocker-backoffice-api"
+  delegate_to: "{{ release_node }}"
+  register: owned_api_stopped
+  changed_when: false
+  until: owned_api_stopped.stdout_lines == ['false', 'false']
+  retries: 60
+  delay: 2
+  when: single_owner_mode.stdout | trim == '1'
+
+- name: Require the peer to pass stable checks through both origins before drainage
+  ansible.builtin.script:
+    cmd: "ops/files/uncloud_ingress_control.py check --company {{ uncloud_company }} --node {{ release_primary if release_node == release_secondary else release_secondary }}"
+    executable: /usr/bin/python3
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['uncloud'] }}"
+
+- name: Drain both origins before changing any application container
+  block:
+    - name: Drain the node on both running HAProxy origins
+      ansible.builtin.script:
+        cmd: "ops/files/uncloud_ingress_control.py drain --company {{ uncloud_company }} --node {{ release_node }}"
+        executable: /usr/bin/python3
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['uncloud'] }}"
+  rescue:
+    - name: Restore the unchanged node on both origins after an incomplete drain
+      ansible.builtin.script:
+        cmd: "ops/files/uncloud_ingress_control.py ready --company {{ uncloud_company }} --node {{ release_node }}"
+        executable: /usr/bin/python3
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['uncloud'] }}"
+    - name: Stop this rollout before changing application containers
+      ansible.builtin.fail:
+        msg: Both origins could not drain safely; original healthy backends restored.
+
+- name: Apply explicitly requested SMTP settings before recreating DataService
+  ansible.builtin.include_tasks: uncloud_apps_smtp_node.yml
+  when: uncloud_refresh_smtp | default(false) | bool
+
+- name: Start this node's preloaded candidate Router during the planned handoff
+  ansible.builtin.command:
+    cmd: >-
+      /usr/bin/python3 /usr/local/sbin/certlocker-uncloud-release update --company {{ uncloud_company }}
+      --selected {{ uncloud_selected_services | to_json | quote }} --router-only
+      --router-ip {{ hostvars[release_node].uncloud_mesh_ip }}
+      {{ '--recreate' if uncloud_force_recreate | default(false) | bool else '' }}
+  async: 1200
+  poll: 5
+  vars:
+    ansible_async_dir: "/dev/shm/certlocker-{{ uncloud_company }}-release-jobs"
+  delegate_to: "{{ release_node }}"
+  when: uncloud_router_changed | bool
+
+- name: Update only selected clients against the intended Router
+  ansible.builtin.command:
+    cmd: >-
+      /usr/bin/python3 /usr/local/sbin/certlocker-uncloud-release update --company {{ uncloud_company }}
+      --selected {{ uncloud_selected_services | to_json | quote }}
+      --mesh-ip {{ hostvars[release_node].uncloud_mesh_ip }}
+      {{ '--recreate' if uncloud_force_recreate | default(false) | bool else '' }}
+      {{ ('--reregister --router-ip ' ~ hostvars[release_node].uncloud_mesh_ip) if uncloud_router_changed | bool else '' }}
+      {{ ('--quiesce-settle-budget ' ~ (uncloud_quiesce_settle_budget | int)) if uncloud_quiesce_settle_budget is defined else '' }}
+  async: 1200
+  poll: 5
+  vars:
+    ansible_async_dir: "/dev/shm/certlocker-{{ uncloud_company }}-release-jobs"
+  delegate_to: "{{ release_node }}"
+
+- name: Require selected release HTTP and ACTIVE registry gates
+  ansible.builtin.script:
+    cmd: >-
+      ops/files/uncloud_apps_verify.py --company {{ uncloud_company }}
+      --mesh-ip {{ hostvars[release_node].uncloud_mesh_ip }} --router-ip current
+      --peer-ip {{ hostvars[release_primary if release_node == release_secondary else release_secondary].uncloud_mesh_ip }}
+      --manifest /opt/certlocker/{{ uncloud_company }}/uncloud-apps/release.candidate.json --node-only
+    executable: /usr/bin/python3
+  delegate_to: "{{ release_node }}"
+
+- name: Return the verified node to service on both HAProxy origins
+  ansible.builtin.script:
+    cmd: "ops/files/uncloud_ingress_control.py ready --company {{ uncloud_company }} --node {{ release_node }}"
+    executable: /usr/bin/python3
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['uncloud'] }}"
+
+- name: Release the local maintenance hold after the node is verified
+  ansible.builtin.file:
+    path: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps/.api-owner-maintenance"
+    state: absent
+  delegate_to: "{{ release_node }}"
+  when: single_owner_mode.stdout | trim == '1'
+
+- name: Record node completion after checks and restoration on both origins
+  ansible.builtin.copy:
+    remote_src: true
+    src: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps/release.candidate.json"
+    dest: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps/release.node-verified.json"
+    mode: '0600'
+  delegate_to: "{{ release_node }}"

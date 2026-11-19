@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+CL_DEPLOY_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$CL_DEPLOY_ROOT/scripts/controller-launch" uncloud "$@"

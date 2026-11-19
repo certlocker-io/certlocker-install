@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Uninstall the enrolled CertLocker stack from two supplied hosts."""
+import argparse
+from contextlib import ExitStack
+import fcntl
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+from certlocker_gateway import operator_gateway
+from uncloud_host_access import installation_key
+from uncloud_install_setup import connect
+from uncloud_support import company_slug, discover_host_trust_names, inventory_directory, revoke_company_trust
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='uncloudctl bare-metal uninstall', description=__doc__)
+    parser.add_argument('company', type=company_slug)
+    parser.add_argument('--trust-url')
+    parser.add_argument('--ssh-key', type=Path, help='Use an existing authorized SSH identity')
+    parser.add_argument('--workstation-ssh', action='store_true', help='Use the workstation SSH agent or default key')
+    parser.add_argument('--yes', action='store_true', help='Confirm deletion of application and database data')
+    args = parser.parse_args()
+    if args.trust_url:
+        os.environ['CERTLOCKER_INSTALL_TRUST_URL'] = operator_gateway(args.trust_url)
+    directory = inventory_directory(args.company)
+    if not directory.exists():
+        print('No active bare-metal inventory for', args.company)
+        return
+    marker = json.loads((directory / '.setup.json').read_text())
+    state = Path(marker['state_dir'])
+    identity = json.loads((state / 'installation.json').read_text())
+    hosts = identity.get('bare_metal_servers', {})
+    names = sorted(hosts)
+    if (len(names) != 2 or marker['company'] != args.company or identity['company'] != args.company
+            or [hosts[n]['ansible_host'] for n in names] != marker['addresses']
+            or any(hosts[n]['uncloud_provider'] != 'supplied' for n in names)):
+        raise ValueError('Expected a saved bare-metal installation for this company')
+    script = Path(__file__).with_name('uncloud_remove_host.py').read_bytes()
+    with ExitStack() as stack:
+        lock = stack.enter_context((directory / '.update.lock').open('a'))
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        clean = directory / '.uninstall-hosts-verified'
+        if not clean.exists():
+            key = args.ssh_key
+            if not key and not args.workstation_ssh:
+                key = stack.enter_context(installation_key(args.company, directory, marker))
+            def run(name, operation):
+                host = hosts[name]
+                address = str(ipaddress.IPv4Address(host['ansible_host']))
+                user = marker['ssh_user']
+                if not re.fullmatch('[a-z_][a-z0-9_-]{0,31}', user):
+                    raise ValueError('Invalid SSH username')
+                cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+                       '-o', 'UserKnownHostsFile=' + str(state / 'known_hosts')]
+                if key:
+                    cmd.extend(['-o', 'IdentitiesOnly=yes', '-i', str(key)])
+                remote = ['sudo', '-n', 'python3', '-', operation, args.company, name,
+                          host['uncloud_machine_id'], host['uncloud_expected_hostname']]
+                subprocess.run([*cmd, user + '@' + address, shlex.join(remote)], input=script, check=True)
+            for name in names:
+                run(name, 'check')
+            if not args.yes and input('Delete application and database data on ' + ', '.join(marker['addresses'])
+                                      + '? Type the company name: ') != args.company:
+                raise ValueError('Uninstall cancelled')
+            (directory / '.uninstalling').touch(mode=0o600)
+            for name in names:
+                run(name, 'remove')
+            for name in names:
+                run(name, 'verify')
+            clean.touch(mode=0o600)
+        print('Both servers verified clean. Completing deployment credential cleanup in Trust.', flush=True)
+        trust = connect(identity['config'], None, interactive=sys.stdin.isatty())
+        extras = discover_host_trust_names(args.company, directory)
+        revoke_company_trust(args.company, trust, extras)
+        print('Deployment credentials revoked in the issuing Trust.')
+    archive = Path(tempfile.mkdtemp(prefix=state.name + '-uninstalled-', dir=state.parent))
+    # Archive only installation-owned state. Custom state directories may contain other files.
+    for pattern in ('bin', 'installation.json', 'inventory.json', 'known_hosts', 'timings-*.json',
+                    'certificate-*.json', 'uncloud.yaml', 'install-chat.json', 'bare-metal-release.json', 'installation-report.json'):
+        for file in state.glob(pattern):
+            file.rename(archive / file.name)
+    shutil.move(str(directory), str(archive / 'inventory'))
+    print('Both servers verified clean. Controller records archived at', archive)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.CalledProcessError) as error:
+        sys.exit(str(error))

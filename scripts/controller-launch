@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+CL_DEPLOY_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+CL_PYTHON=$(command -v python3 || true)
+if [ -z "$CL_PYTHON" ] || ! "$CL_PYTHON" -c 'import sys; raise SystemExit(not (3,10) <= sys.version_info[:2] <= (3,15))'; then
+    if [ "$(uname -s)" = Darwin ]; then
+        CL_BREW=$(command -v brew || true)
+        if [ -z "$CL_BREW" ]; then
+            if [ -x /opt/homebrew/bin/brew ]; then CL_BREW=/opt/homebrew/bin/brew;
+            elif [ -x /usr/local/bin/brew ]; then CL_BREW=/usr/local/bin/brew;
+            else
+                CL_BREW_SCRIPT=$(mktemp)
+                trap 'rm -f "$CL_BREW_SCRIPT"' EXIT HUP INT TERM
+                curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$CL_BREW_SCRIPT"
+                /bin/bash "$CL_BREW_SCRIPT"
+                if [ -x /opt/homebrew/bin/brew ]; then CL_BREW=/opt/homebrew/bin/brew; else CL_BREW=/usr/local/bin/brew; fi
+            fi
+        fi
+        "$CL_BREW" install python@3.12
+        CL_PYTHON=$("$CL_BREW" --prefix python@3.12)/bin/python3.12
+    elif command -v apt-get >/dev/null 2>&1; then
+        if [ "$(id -u)" = 0 ]; then
+            apt-get update
+            apt-get install -y python3
+        else
+            sudo apt-get update
+            sudo apt-get install -y python3
+        fi
+        CL_PYTHON=$(command -v python3)
+    else
+        echo 'Install Python 3.10 or newer, then rerun this command.' >&2
+        exit 1
+    fi
+fi
+CLOUDSDK_PYTHON=${CLOUDSDK_PYTHON:-$CL_PYTHON}
+export CLOUDSDK_PYTHON
+if [ "${1:-}" = --entry ]; then
+    shift
+    CL_ENTRY=$1
+    shift
+    exec "$CL_PYTHON" "$CL_DEPLOY_ROOT/$CL_ENTRY" "$@"
+fi
+exec "$CL_PYTHON" "$CL_DEPLOY_ROOT/scripts/controller_runtime.py" "$@"

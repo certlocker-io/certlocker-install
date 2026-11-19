@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Apply this checkout's checksum-verified release through the installed HA pair."""
+import argparse
+from contextlib import ExitStack
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+from certlocker_gateway import operator_gateway
+from uncloud_progress import format_duration
+from uncloud_install_setup import connect, fetch_object
+from uncloud_host_access import provisioning_key
+from uncloud_support import (ROOT, bundled_release_manifest, company_slug, inventory_directory,
+                             prepare_ingress, prepare_trust, resolve_environment, run_ansible, write_private)
+import base64
+import re
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='uncloudctl update', description=__doc__)
+    parser.add_argument('company', nargs='?', type=company_slug)
+    parser.add_argument('--plan', action='store_true')
+    parser.add_argument('--trust-url')
+    args = parser.parse_args()
+    started = time.monotonic()
+    company = args.company
+    if not company:
+        installed = sorted(marker for marker in (ROOT / 'inventory/uncloud').glob('*/.setup.json')
+                           if (marker.parent / 'release.json').is_file())
+        if len(installed) != 1:
+            parser.error('Specify the installed company when there is not exactly one active inventory')
+        company = company_slug(installed[0].parent.name)
+    directory = inventory_directory(company)
+    marker = json.loads((directory / '.setup.json').read_text())
+    if marker.get('company') != company:
+        raise ValueError('Installation company mismatch')
+    state = Path(marker['state_dir'])
+    config = json.loads((state / 'installation.json').read_text())['config']
+    hosts = json.loads((directory / 'hosts.json').read_text())['all']['children']['uncloud']['hosts']
+    with ExitStack() as stack:
+        lock = stack.enter_context((directory / '.update.lock').open('a'))
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if (directory / '.uninstalling').exists():
+            raise ValueError('Resume the interrupted uninstall before updating')
+        installed = directory / 'release.json'
+        current = json.loads(installed.read_text())
+        manifest, _ = bundled_release_manifest(ROOT / 'releases/current.json', registry_prefix=config.get('registry_prefix'))
+        if set(current['services']) != set(manifest['services']):
+            raise ValueError('Incompatible application service set')
+        def version(value):
+            return tuple(map(int, value['release'].removeprefix('prod_').split('.')))
+        if version(manifest) < version(current):
+            raise ValueError('Checkout manifest predates the installed release')
+        changed = [name for name, service in manifest['services'].items() if service['image'] != current['services'][name]['image']]
+        print(current['release'], '->', manifest['release'], 'Changed services:', ', '.join(changed) or 'none', flush=True)
+        candidate = directory / 'release.candidate.json'
+        resuming = candidate.exists()
+        if resuming and json.loads(candidate.read_text()) != manifest:
+            raise ValueError('Finish or reconcile the pending release before selecting another manifest')
+        if args.plan or (manifest == current and not resuming):
+            return
+        if args.trust_url:
+            os.environ['CERTLOCKER_INSTALL_TRUST_URL'] = operator_gateway(args.trust_url)
+        trust = connect(config, None, interactive=sys.stdin.isatty())
+        key = stack.enter_context(provisioning_key(company, directory, hosts, trust, marker['ssh_user']))
+        loader = importlib.machinery.SourceFileLoader('update_setup', str(ROOT / 'scripts/setup-ha'))
+        setup = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(setup)
+        setup.prepare_ssh(state)
+        for host in hosts.values():
+            if setup.ssh(key, host['ansible_host'], 'hostname -s', user=marker['ssh_user']).strip() != host['uncloud_expected_hostname']:
+                raise ValueError('Server hostname differs from installation inventory')
+        variables = prepare_trust(company, trust, allow_create=False) + ['vault_certlocker_database_identity']
+        values = resolve_environment(company, trust, variables)
+        values.update(prepare_ingress(company, trust, allow_create=False, certificate=False))
+        if config.get('registry_mode', 'ghcr') == 'ghcr' and config.get('install_config_id'):
+            record = trust.lookup_metadata(trust.group + '_install_config')
+            if not record or record['id'] != config.get('install_config_id'):
+                raise ValueError('Install configuration differs from the saved installation')
+            encoded = fetch_object(trust, record['id']).get('image_pull_access')
+            if encoded:
+                login = base64.b64decode(encoded, validate=True).decode('ascii')
+                user, sep, token = login.partition(':')
+                if not sep or user != values['vault_certlocker_application_settings']['ghcr_username'] or not re.fullmatch('ghp_[A-Za-z0-9]+', token):
+                    raise ValueError('Invalid release image access in installation configuration')
+                values['vault_cr_pat'] = token
+            else:
+                values.update(resolve_environment(company, trust, ['vault_cr_pat']))
+        elif config.get('registry_mode', 'ghcr') == 'ghcr':
+            values.update(resolve_environment(company, trust, ['vault_cr_pat']))
+
+        def play(name, extra=None):
+            command = ['ansible-playbook', '-i', directory / 'hosts.json', ROOT / 'playbooks' / (name + '.yml'), '--private-key', key]
+            if extra:
+                command.extend(['-e', json.dumps(extra)])
+            run_ansible(command, values, require_no_swap=config.get('registry_mode') == 'gcp')
+        gates = ['uncloud_host_verify', 'uncloud_network_verify', 'uncloud_database_verify']
+        if not resuming:
+            gates.extend(['uncloud_apps_verify', 'uncloud_ha_verify'])
+        for name in gates:
+            play(name)
+        write_private(directory / 'release.previous.json', json.dumps(current, indent=2))
+        staged = candidate.with_suffix('.tmp')
+        write_private(staged, json.dumps(manifest, indent=2))
+        staged.replace(candidate)
+        extra = dict(uncloud_manifest_source=str(candidate), uncloud_router_changed='router' in changed,
+                     uncloud_selected_services=changed, uncloud_force_recreate=False)
+        if changed:
+            play('uncloud_apps_maintenance', {'uncloud_recovery_state':'stopped'})
+            try:
+                play('uncloud_apps_release', extra)
+                play('uncloud_apps_verify', extra)
+            except BaseException:
+                print('Rollout stopped. Reconcile node health before restarting recovery timers.', file=sys.stderr)
+                raise
+            play('uncloud_apps_maintenance', {'uncloud_recovery_state':'started'})
+        if not changed:
+            play('uncloud_apps_verify', extra)
+        play('uncloud_database_verify')
+        play('uncloud_ha_verify')
+        candidate.replace(installed)
+        print('Rolling release verified:', manifest['release'], 'in', format_duration(time.monotonic() - started))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.CalledProcessError) as error:
+        sys.exit(str(error))

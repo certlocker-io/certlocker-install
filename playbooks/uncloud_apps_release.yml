@@ -1,0 +1,264 @@
+---
+- name: Stage selected application images without rendering secrets or changing running containers
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    app_root: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps"
+    runtime_secrets: "/run/certlocker/{{ uncloud_company }}"
+  tasks:
+    - name: Require an explicit application selection
+      ansible.builtin.assert:
+        that:
+          - uncloud_selected_services | length > 0
+          - uncloud_selected_services | difference(['router', 'dataservice', 'gateway', 'bastion-server', 'edge', 'backoffice-api', 'ui', 'backoffice-ui']) | length == 0
+
+    - name: Require the reserved deployment key for internal service authentication
+      ansible.builtin.assert:
+        that:
+          - vault_certlocker_stack_env_key | length >= 32
+          - vault_certlocker_application_settings is mapping
+      no_log: true
+
+    - name: Check for the currently deployed manifest
+      ansible.builtin.stat:
+        path: "{{ app_root }}/release.json"
+      register: installed_release_stat
+
+    - name: Read the currently deployed manifest for rollback selection
+      ansible.builtin.slurp:
+        src: "{{ app_root }}/release.json"
+      register: installed_release_content
+      when: installed_release_stat.stat.exists
+
+    - name: Preserve the current release as the selected rollback image set
+      ansible.builtin.copy:
+        dest: "{{ app_root }}/release.rollback.json"
+        content: "{{ installed_release_content.content | b64decode }}"
+        mode: '0600'
+      when:
+        - installed_release_stat.stat.exists
+        - (installed_release_content.content | b64decode | from_json) != (lookup('file', uncloud_manifest_source) | from_json)
+
+    - name: Copy the non-secret candidate manifest
+      ansible.builtin.copy:
+        src: "{{ uncloud_manifest_source }}"
+        dest: "{{ app_root }}/release.candidate.json"
+        mode: '0600'
+
+    - name: Load the candidate manifest for Compose structure updates
+      ansible.builtin.set_fact:
+        uncloud_release_manifest: "{{ lookup('file', uncloud_manifest_source) | from_json }}"
+
+    - name: Materialize the internal service authentication key before any candidate process starts
+      ansible.builtin.copy:
+        dest: "{{ runtime_secrets }}/internal-service-key"
+        content: "{{ vault_certlocker_stack_env_key }}"
+        mode: '0400'
+      no_log: true
+
+    - name: Install the runtime credential helper used to reseal after key materialization
+      ansible.builtin.copy:
+        src: ops/files/uncloud_runtime_secrets.py
+        dest: /usr/local/sbin/certlocker-uncloud-runtime
+        mode: '0755'
+
+    - name: Reseal runtime credentials so boot restore includes the internal service key
+      ansible.builtin.command: "/usr/local/sbin/certlocker-uncloud-runtime seal --company {{ uncloud_company }}"
+      no_log: true
+
+    - name: Create the directory for an optional Install Setup credential
+      ansible.builtin.file:
+        path: /etc/certlocker/install-setup
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Provision Install Setup image access
+      ansible.builtin.import_tasks: tasks/install_setup_credential.yml
+
+    - name: Read host RAM for application heap sizing
+      ansible.builtin.command:
+        argv: [awk, '/^MemTotal:/ {print $2}', /proc/meminfo]
+      register: uncloud_host_memory_kib
+      changed_when: false
+
+    - name: Stage application Compose without changing either running node
+      ansible.builtin.template:
+        src: ../uncloud/apps/compose.yaml.j2
+        dest: "{{ app_root }}/compose.candidate.yaml"
+        mode: '0600'
+
+    - name: Install the selected-image staging helper
+      ansible.builtin.copy:
+        src: ops/files/uncloud_apps_release.py
+        dest: /usr/local/sbin/certlocker-uncloud-release
+        mode: '0755'
+
+    - name: Refresh HA recovery helpers before tip-of-dev Router authentication is required
+      ansible.builtin.copy:
+        src: "ops/files/{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: '0755'
+      loop:
+        - {src: uncloud_watchdog.py, dest: /usr/local/sbin/certlocker-uncloud-watchdog}
+        - {src: uncloud_api_owner.py, dest: /usr/local/sbin/certlocker-uncloud-api-owner}
+      loop_control:
+        label: "{{ item.dest }}"
+
+    - name: Inspect the selected immutable image references on each node
+      ansible.builtin.command:
+        argv: [python3, /usr/local/sbin/certlocker-uncloud-release, cached, --company, "{{ uncloud_company }}", --selected, "{{ uncloud_selected_services | to_json }}"]
+      register: release_cache
+      changed_when: false
+      failed_when: release_cache.rc not in [0, 1]
+
+    - name: Validate staged Compose using previously pulled digest-pinned images
+      ansible.builtin.command:
+        argv: [python3, /usr/local/sbin/certlocker-uncloud-release, stage, --cached-only, --company, "{{ uncloud_company }}", --selected, "{{ uncloud_selected_services | to_json }}"]
+      when: release_cache.rc == 0
+
+    - name: Stage selected images without retaining registry credentials
+      ansible.builtin.include_tasks: uncloud_image_pull.yml
+      when: release_cache.rc != 0
+      vars:
+        uncloud_pull_argv: [python3, /usr/local/sbin/certlocker-uncloud-release, stage, --company, "{{ uncloud_company }}", --selected, "{{ uncloud_selected_services | to_json }}"]
+
+    - name: Record successful staging on this node for the current playbook run
+      ansible.builtin.set_fact:
+        release_stage_complete: true
+
+- name: Roll applications through the preinstalled HA Router pair
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Coordinate the pair once
+      run_once: true
+      block:
+        - name: Require both nodes to have staged successfully in this run
+          ansible.builtin.assert:
+            that: groups['uncloud'] | map('extract', hostvars) | selectattr('release_stage_complete', 'defined') | list | length == 2
+
+        - name: Detect single-owner application release policy
+          ansible.builtin.command:
+            cmd: "grep -c '^HA_API_SINGLE_OWNER=1$' /opt/certlocker/{{ uncloud_company }}/uncloud-apps/.env"
+          register: release_owner_mode
+          changed_when: false
+          failed_when: release_owner_mode.rc not in [0, 1]
+
+        - name: Discover actual database roles before selecting rollout order
+          ansible.builtin.shell: |
+            docker exec certlocker-uncloud-postgres bash -ec '
+              export PGPASSWORD="$(cat /run/lab-secrets/postgres)" PGSSLMODE=require
+              exec psql -h 127.0.0.1 -U postgres -d certlocker -At -c "SELECT pg_is_in_recovery()"'
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['uncloud'] }}"
+          register: release_roles
+          changed_when: false
+          no_log: true
+
+        - name: Require one primary and one standby
+          ansible.builtin.assert:
+            that:
+              - release_roles.results | map(attribute='stdout') | map('trim') | sort == ['f', 't']
+
+        - name: Select rollout order from current database roles
+          ansible.builtin.set_fact:
+            release_primary: "{{ (release_roles.results | selectattr('stdout', 'equalto', 'f') | first).item }}"
+            release_secondary: "{{ (release_roles.results | selectattr('stdout', 'equalto', 't') | first).item }}"
+
+        - name: Preserve and validate a private database archive before Java updates
+          ansible.builtin.shell: |
+            set -eu
+            backup="/var/lib/certlocker/maintenance/{{ uncloud_company }}-release-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+            install -d -m 0700 "$backup"
+            umask 077
+            docker exec certlocker-uncloud-postgres bash -ec '
+              export PGPASSWORD="$(cat /run/lab-secrets/postgres)" PGSSLMODE=require
+              exec pg_dump -h 127.0.0.1 -U postgres -d certlocker --format=custom' > "$backup/database.dump"
+            docker exec -i certlocker-uncloud-postgres pg_restore --list < "$backup/database.dump" >/dev/null
+          delegate_to: "{{ release_primary }}"
+          when:
+            - uncloud_selected_services | difference(['ui', 'backoffice-ui']) | length > 0
+            - not (uncloud_skip_database_archive | default(false) | bool)
+          no_log: true
+
+        - name: Check which nodes already completed this exact candidate
+          ansible.builtin.command:
+            argv: [cmp, -s, "/opt/certlocker/{{ uncloud_company }}/uncloud-apps/release.candidate.json", "/opt/certlocker/{{ uncloud_company }}/uncloud-apps/release.node-verified.json"]
+          delegate_to: "{{ item }}"
+          loop: "{{ [release_secondary, release_primary] }}"
+          register: release_verified_nodes
+          changed_when: false
+          failed_when: release_verified_nodes.rc not in [0, 1, 2]
+
+        - name: Roll the standby then the primary through the running ingress
+          ansible.builtin.include_tasks: uncloud_apps_release_node.yml
+          loop: "{{ release_verified_nodes.results | rejectattr('rc', 'equalto', 0) | map(attribute='item') | list }}"
+          loop_control:
+            loop_var: release_node
+
+        - name: Drain the standby before returning its clients to the elected Router
+          ansible.builtin.script:
+            cmd: "ops/files/uncloud_ingress_control.py drain --company {{ uncloud_company }} --node {{ release_secondary }}"
+            executable: /usr/bin/python3
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['uncloud'] }}"
+          when: uncloud_router_changed | bool and release_owner_mode.stdout | trim != '1'
+
+        - name: Reconnect standby clients to the upgraded primary Router without restarting them
+          ansible.builtin.command:
+            cmd: >-
+              /usr/bin/python3 /usr/local/sbin/certlocker-uncloud-release update --company {{ uncloud_company }}
+              --selected {{ uncloud_selected_services | to_json | quote }} --handoff-only
+              --mesh-ip {{ hostvars[release_secondary].uncloud_mesh_ip }}
+              --router-ip {{ hostvars[release_primary].uncloud_mesh_ip }}
+          async: 1200
+          poll: 5
+          vars:
+            ansible_async_dir: "/dev/shm/certlocker-{{ uncloud_company }}-release-jobs"
+          delegate_to: "{{ release_secondary }}"
+          when: uncloud_router_changed | bool
+
+        - name: Remove the temporary standby Router after returning its clients
+          ansible.builtin.command:
+            cmd: docker compose rm --stop --force router
+            chdir: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps"
+          delegate_to: "{{ release_secondary }}"
+          when: uncloud_router_changed | bool
+
+        - name: Verify final standby registrations against the primary Router
+          ansible.builtin.script:
+            cmd: >-
+              ops/files/uncloud_apps_verify.py --company {{ uncloud_company }}
+              --mesh-ip {{ hostvars[release_secondary].uncloud_mesh_ip }} --router-ip current
+              --peer-ip {{ hostvars[release_primary].uncloud_mesh_ip }}
+              --manifest /opt/certlocker/{{ uncloud_company }}/uncloud-apps/release.candidate.json
+            executable: /usr/bin/python3
+          delegate_to: "{{ release_secondary }}"
+          when: uncloud_router_changed | bool
+
+        - name: Restore verified standby traffic on both origins
+          ansible.builtin.script:
+            cmd: "ops/files/uncloud_ingress_control.py ready --company {{ uncloud_company }} --node {{ release_secondary }}"
+            executable: /usr/bin/python3
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['uncloud'] }}"
+          when: uncloud_router_changed | bool and release_owner_mode.stdout | trim != '1'
+
+- name: Commit the verified release manifest on both servers
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Mark the new app images as the current release after rollout completion
+      ansible.builtin.copy:
+        src: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps/release.candidate.json"
+        dest: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps/release.json"
+        remote_src: true
+        mode: '0600'

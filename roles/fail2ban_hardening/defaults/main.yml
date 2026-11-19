@@ -1,0 +1,10 @@
+---
+fail2ban_ignore_ips:
+  - 127.0.0.1/8
+  - "::1"
+  - 10.77.0.0/24
+  - 88.81.117.228  # certlocker updater
+  - 185.88.0.182  # certlocker updater
+fail2ban_bantime: 1h
+fail2ban_findtime: 10m
+fail2ban_maxretry: 3

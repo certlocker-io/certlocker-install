@@ -1,0 +1,136 @@
+---
+- name: Install automatic HA role following and registry recovery on both nodes
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Install packet-gate tooling for application ownership
+      ansible.builtin.apt:
+        name: nftables
+        state: present
+      when: uncloud_api_single_owner | default(true) | bool
+
+    - name: Install the single-owner application supervisor
+      ansible.builtin.copy:
+        src: ops/files/uncloud_api_owner.py
+        dest: /usr/local/sbin/certlocker-uncloud-api-owner
+        mode: '0755'
+      register: uncloud_owner_script
+      when: uncloud_api_single_owner | default(true) | bool
+
+    - name: Install the Uncloud adapter for the existing HA watchdog behavior
+      ansible.builtin.copy:
+        src: ops/files/uncloud_watchdog.py
+        dest: /usr/local/sbin/certlocker-uncloud-watchdog
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install the role and registration recovery service
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/certlocker-{{ uncloud_company }}-ha.service"
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=CertLocker HA database role and Router registration recovery
+          After=docker.service uncloud.service certlocker-uncloud-db.service
+          Requires=docker.service
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/certlocker-uncloud-watchdog --company {{ uncloud_company }} --local {{ uncloud_mesh_ip }} --peer {{ hostvars[(groups['uncloud'] | difference([inventory_hostname]) | first)].uncloud_mesh_ip }}
+          TimeoutStartSec=900
+          UMask=0077
+
+    - name: Install the recovery timer
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/certlocker-{{ uncloud_company }}-ha.timer"
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Run CertLocker HA reconciliation three seconds after each completed check
+          [Timer]
+          OnBootSec=5
+          OnUnitInactiveSec=3
+          AccuracySec=1
+          [Install]
+          WantedBy=timers.target
+
+    - name: Enable automatic recovery at boot and now
+      ansible.builtin.systemd_service:
+        name: "certlocker-{{ uncloud_company }}-ha.timer"
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Require one successful role and registration reconciliation during setup
+      ansible.builtin.systemd_service:
+        name: "certlocker-{{ uncloud_company }}-ha.service"
+        state: started
+
+    - name: Initialize the application lease on the verified primary
+      ansible.builtin.command:
+        cmd: >-
+          /usr/local/sbin/certlocker-uncloud-api-owner initialize --company {{ uncloud_company }}
+          --local {{ uncloud_mesh_ip }}
+          --peer {{ hostvars[(groups['uncloud'] | difference([inventory_hostname]) | first)].uncloud_mesh_ip }}
+          --preferred {{ hostvars[groups['uncloud'][0]].uncloud_mesh_ip }}
+      run_once: true
+      when: uncloud_api_single_owner | default(true) | bool
+
+    - name: Check whether application ownership was already installed
+      ansible.builtin.stat:
+        path: "/etc/systemd/system/certlocker-{{ uncloud_company }}-api-owner.service"
+      register: owner_unit
+
+    - name: Create cold API containers without starting either replica
+      ansible.builtin.command:
+        cmd: docker compose --profile owned-api create --no-recreate edge backoffice-api
+        chdir: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps"
+      when: uncloud_api_single_owner | default(true) | bool
+
+    - name: Disable Docker automatic startup of owned APIs
+      ansible.builtin.command:
+        argv: [docker, update, '--restart=no', certlocker-edge, certlocker-backoffice-api]
+      when: uncloud_api_single_owner | default(true) | bool
+
+    - name: Withdraw old active-active APIs before the first ownership election
+      ansible.builtin.command:
+        cmd: >-
+          /usr/local/sbin/certlocker-uncloud-api-owner stop --company {{ uncloud_company }}
+          --local {{ uncloud_mesh_ip }}
+          --peer {{ hostvars[(groups['uncloud'] | difference([inventory_hostname]) | first)].uncloud_mesh_ip }}
+          --preferred {{ hostvars[groups['uncloud'][0]].uncloud_mesh_ip }}
+      when:
+        - uncloud_api_single_owner | default(true) | bool
+        - not owner_unit.stat.exists
+
+    - name: Install application ownership with a cleanup hook on supervisor failure
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/certlocker-{{ uncloud_company }}-api-owner.service"
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=CertLocker single serving Edge and Backoffice owner
+          After=docker.service uncloud.service certlocker-uncloud-db.service certlocker-{{ uncloud_company }}-runtime.service
+          Requires=docker.service
+          [Service]
+          Type=simple
+          ExecStart=/usr/local/sbin/certlocker-uncloud-api-owner run --company {{ uncloud_company }} --local {{ uncloud_mesh_ip }} --peer {{ hostvars[(groups['uncloud'] | difference([inventory_hostname]) | first)].uncloud_mesh_ip }} --preferred {{ hostvars[groups['uncloud'][0]].uncloud_mesh_ip }}
+          ExecStopPost=/usr/local/sbin/certlocker-uncloud-api-owner stop --company {{ uncloud_company }} --local {{ uncloud_mesh_ip }} --peer {{ hostvars[(groups['uncloud'] | difference([inventory_hostname]) | first)].uncloud_mesh_ip }} --preferred {{ hostvars[groups['uncloud'][0]].uncloud_mesh_ip }}
+          Restart=always
+          RestartSec=3
+          TimeoutStopSec=25
+          UMask=0077
+          [Install]
+          WantedBy=multi-user.target
+      register: uncloud_owner_service
+      when: uncloud_api_single_owner | default(true) | bool
+
+    - name: Enable the application owner on both machines
+      ansible.builtin.systemd_service:
+        name: "certlocker-{{ uncloud_company }}-api-owner.service"
+        enabled: true
+        daemon_reload: true
+        state: "{{ 'restarted' if (uncloud_owner_script.changed or uncloud_owner_service.changed) else 'started' }}"
+      when: uncloud_api_single_owner | default(true) | bool

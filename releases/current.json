@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "release": "prod_1.1.30",
+  "services": {
+    "router": {
+      "image": "ghcr.io/certlocker-io/trust/certlocker-router@sha256:7bd8751de66e91bb90b12feea50fdc5e1676b1967a1cbf2d0713cd79f08bc569",
+      "version": "prod_1.1.30"
+    },
+    "dataservice": {
+      "image": "ghcr.io/certlocker-io/trust/certlocker-dataservice@sha256:80b3fc9e8b44a38fd030c73ddfd76e8ddfd792b1c264a22c295063f8099c4e6a",
+      "version": "prod_1.1.30"
+    },
+    "gateway": {
+      "image": "ghcr.io/certlocker-io/trust/certlocker-gateway@sha256:41ce6894b01b6c68c8a3cb2b55c132f8cf3f497c5bc9c597d2dff4129e9de9d8",
+      "version": "prod_1.1.30"
+    },
+    "bastion-server": {
+      "image": "ghcr.io/certlocker-io/trust/certlocker-bastion-server@sha256:50bb0f01469121787cf78c19ba03aa03b401a030e97f803449624d0724406390",
+      "version": "prod_1.1.30"
+    },
+    "edge": {
+      "image": "ghcr.io/certlocker-io/trust/certlocker-edge@sha256:54e15ded4782fe45bd14fda46b8d6ad99581f86fdc538af27ddc261e293904ed",
+      "version": "prod_1.1.30"
+    },
+    "backoffice-api": {
+      "image": "ghcr.io/certlocker-io/trust/certlocker-backoffice@sha256:40bba3dd62bad55f99e345dbd4bb01a8633fbc3da64e7d3fe5b59ef8ff41be5d",
+      "version": "prod_1.1.30"
+    },
+    "ui": {
+      "image": "ghcr.io/certlocker-io/ui-edge/cl-fe@sha256:ce3f788c18280bf45722dcbd4ffd04b9efd9b58b825f97d7fbb30452d2a5d968",
+      "version": "prod_1.1.30"
+    },
+    "backoffice-ui": {
+      "image": "ghcr.io/certlocker-io/ui-bo/cl-bo@sha256:98c2b6b82f56356549fe188b84f0a894f7ca1acd0a3c8010f65ab0efbfb720e7",
+      "version": "prod_1.1.30"
+    }
+  }
+}

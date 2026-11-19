@@ -1,0 +1,264 @@
+---
+# DNS first: ensure resolv.conf has only 1.1.1.1 and 8.8.8.8 before apt/get_url.
+- name: Check if resolv.conf has correct DNS (1.1.1.1 and 8.8.8.8 only)
+  ansible.builtin.shell: |
+    test -f /etc/resolv.conf && \
+    grep -qFx 'nameserver 1.1.1.1' /etc/resolv.conf && \
+    grep -qFx 'nameserver 8.8.8.8' /etc/resolv.conf && \
+    [ $(grep -c '^nameserver' /etc/resolv.conf 2>/dev/null || echo 0) -eq 2 ]
+  register: resolv_correct
+  changed_when: false
+  failed_when: false
+  when: baseline_manage_resolv_conf | bool
+
+- name: Fix resolv.conf when DNS is wrong
+  block:
+    - name: Remove resolv.conf (symlink or file)
+      ansible.builtin.file:
+        path: /etc/resolv.conf
+        state: absent
+
+    - name: Create static resolv.conf with 1.1.1.1 and 8.8.8.8 only
+      ansible.builtin.copy:
+        dest: /etc/resolv.conf
+        content: |
+          nameserver 1.1.1.1
+          nameserver 8.8.8.8
+        owner: root
+        group: root
+        mode: "0644"
+        force: true
+  when:
+    - baseline_manage_resolv_conf | bool
+    - resolv_correct.rc | default(0) != 0
+
+- name: Validate supported operating system
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.os_family == "Debian"
+    fail_msg: "This role currently supports Debian/Ubuntu hosts only."
+
+- name: Decide whether Adoptium repo should be used
+  ansible.builtin.set_fact:
+    baseline_use_adoptium_repo: "{{ package_state == 'present' and (use_adoptium_repo | bool) }}"
+
+- name: Ensure APT keyrings directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when:
+    - baseline_use_adoptium_repo
+
+- name: Add Adoptium APT key
+  ansible.builtin.get_url:
+    url: https://packages.adoptium.net/artifactory/api/gpg/key/public
+    dest: /etc/apt/keyrings/adoptium.asc
+    mode: "0644"
+    force: true
+    timeout: 20
+  register: baseline_adoptium_key_download
+  retries: 3
+  delay: 5
+  until: baseline_adoptium_key_download is succeeded
+  ignore_errors: true
+  when:
+    - baseline_use_adoptium_repo
+
+- name: Disable Adoptium repo when key download fails
+  ansible.builtin.set_fact:
+    baseline_use_adoptium_repo: false
+  when:
+    - baseline_use_adoptium_repo
+    - baseline_adoptium_key_download is failed
+
+- name: Add Adoptium APT repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/adoptium.asc] https://packages.adoptium.net/artifactory/deb {{ ansible_distribution_release }} main"
+    filename: adoptium
+    state: present
+    update_cache: true
+  when:
+    - baseline_use_adoptium_repo
+
+# Java: Adoptium -> java_package; Java 25 required -> [] (manual install); else fallback.
+- name: Set Java package list for apt
+  ansible.builtin.set_fact:
+    baseline_apt_java_packages: "{{ baseline_use_adoptium_repo | ternary([java_package], ([] if (baseline_java_version_required | default(0) | int) == 25 else [baseline_java_fallback_package])) }}"
+
+- name: Install baseline packages and Java (apt)
+  ansible.builtin.apt:
+    name: "{{ baseline_packages + baseline_apt_java_packages }}"
+    state: "{{ package_state }}"
+    update_cache: "{{ not baseline_use_adoptium_repo }}"
+  when: package_state == "present"
+
+- name: Check if Java 25 already present
+  ansible.builtin.command: java -version
+  register: baseline_java_version_check
+  changed_when: false
+  failed_when: false
+
+# Keep later apt updates (fail2ban, Docker refresh) off the Adoptium CDN once Java is present.
+- name: Disable Adoptium APT source after Java is installed
+  ansible.builtin.file:
+    path: /etc/apt/sources.list.d/adoptium.list
+    state: absent
+  when:
+    - package_state == "present"
+    - "'25' in (baseline_java_version_check.stderr + baseline_java_version_check.stdout)"
+
+- name: Manual install Java 25 (Eclipse Temurin) when Adoptium repo unreachable
+  block:
+    - name: Ensure /opt/jdk exists
+      ansible.builtin.file:
+        path: /opt/jdk
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Download Eclipse Temurin JDK 25
+      ansible.builtin.get_url:
+        url: "https://api.adoptium.net/v3/binary/latest/25/ga/linux/{{ (ansible_architecture == 'x86_64') | ternary('x64', 'aarch64') }}/jdk/hotspot/normal/eclipse?project=jdk"
+        dest: /tmp/openjdk-25.tar.gz
+        mode: "0644"
+        force: true
+        timeout: 120
+      register: baseline_java25_download
+      retries: 3
+      delay: 10
+      until: baseline_java25_download is succeeded
+
+    - name: Extract JDK 25 to /opt/jdk
+      ansible.builtin.unarchive:
+        src: /tmp/openjdk-25.tar.gz
+        dest: /opt/jdk
+        remote_src: true
+      register: baseline_java25_extract
+
+    - name: Find Java 25 home
+      ansible.builtin.shell: ls -1 /opt/jdk/
+      register: baseline_jdk_dirs
+      changed_when: false
+
+    - name: Set Java 25 home path
+      ansible.builtin.set_fact:
+        baseline_manual_java_home: "/opt/jdk/{{ baseline_jdk_dirs.stdout_lines | first }}"
+
+    - name: Register java in update-alternatives
+      ansible.builtin.alternatives:
+        name: java
+        path: "{{ baseline_manual_java_home }}/bin/java"
+        priority: 1
+
+    - name: Register javac in update-alternatives
+      ansible.builtin.alternatives:
+        name: javac
+        path: "{{ baseline_manual_java_home }}/bin/javac"
+        priority: 1
+
+    - name: Set JAVA_HOME in /etc/environment
+      ansible.builtin.lineinfile:
+        path: /etc/environment
+        regexp: "^JAVA_HOME="
+        line: 'JAVA_HOME="{{ baseline_manual_java_home }}"'
+        state: present
+
+    - name: Remove JDK tarball
+      ansible.builtin.file:
+        path: /tmp/openjdk-25.tar.gz
+        state: absent
+  when:
+    - package_state == "present"
+    - not baseline_use_adoptium_repo
+    - (baseline_java_version_required | default(0) | int) == 25
+    - "'25' not in (baseline_java_version_check.stderr + baseline_java_version_check.stdout)"
+
+- name: Remove Java (apt packages) when package_state absent
+  ansible.builtin.apt:
+    name:
+      - "{{ java_package }}"
+      - "{{ baseline_java_fallback_package }}"
+    state: absent
+    purge: true
+    autoremove: true
+    update_cache: false
+  when: package_state == "absent"
+
+- name: Remove manual Java 25 install when package_state absent
+  block:
+    - name: Stat /opt/jdk
+      ansible.builtin.stat:
+        path: /opt/jdk
+      register: baseline_opt_jdk_stat
+
+    - name: List /opt/jdk subdirs
+      ansible.builtin.shell: ls -1 /opt/jdk 2>/dev/null
+      register: baseline_opt_jdk_dirs
+      changed_when: false
+      when: baseline_opt_jdk_stat.stat.exists
+
+    - name: Remove java/javac alternatives for manual install
+      ansible.builtin.shell: "update-alternatives --remove {{ item.alt }} /opt/jdk/{{ baseline_opt_jdk_dirs.stdout_lines | first }}/bin/{{ item.alt }}"
+      loop:
+        - { alt: java }
+        - { alt: javac }
+      when:
+        - baseline_opt_jdk_stat.stat.exists
+        - baseline_opt_jdk_dirs.stdout_lines | default([]) | length > 0
+      failed_when: false
+
+    - name: Remove /opt/jdk
+      ansible.builtin.file:
+        path: /opt/jdk
+        state: absent
+
+    - name: Remove JAVA_HOME from /etc/environment
+      ansible.builtin.lineinfile:
+        path: /etc/environment
+        regexp: "^JAVA_HOME="
+        state: absent
+  when:
+    - package_state == "absent"
+    - (baseline_java_version_required | default(0) | int) == 25
+
+- name: Remove Adoptium APT repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/adoptium.asc] https://packages.adoptium.net/artifactory/deb {{ ansible_distribution_release }} main"
+    filename: adoptium
+    state: absent
+    update_cache: true
+  when:
+    - package_state == "absent"
+    - use_adoptium_repo | bool
+
+- name: Remove Adoptium APT key
+  ansible.builtin.file:
+    path: /etc/apt/keyrings/adoptium.asc
+    state: absent
+  when:
+    - package_state == "absent"
+    - use_adoptium_repo | bool
+
+# Optional: passwordless sudo for specified users (e.g. host_vms)
+- name: Grant passwordless sudo to users
+  ansible.builtin.lineinfile:
+    path: "/etc/sudoers.d/99-baseline-nopasswd"
+    line: "{{ item }} ALL=(ALL) NOPASSWD:ALL"
+    create: true
+    mode: "0440"
+    validate: "visudo -cf %s"
+  loop: "{{ baseline_sudo_nopasswd_users }}"
+  when: baseline_sudo_nopasswd_users | length > 0
+
+# Optional: SSH authorized_keys for specified users
+- name: Add SSH authorized keys for users
+  ansible.builtin.authorized_key:
+    user: "{{ item.user }}"
+    key: "{{ item.key }}"
+    state: present
+  loop: "{{ baseline_authorized_keys }}"
+  when: baseline_authorized_keys | length > 0

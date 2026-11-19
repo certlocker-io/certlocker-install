@@ -1,0 +1,21 @@
+---
+- name: Coordinate automatic recovery with a planned application deployment
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Stop or resume the installed HA timer
+      ansible.builtin.systemd_service:
+        name: "certlocker-{{ uncloud_company }}-ha.timer"
+        state: "{{ uncloud_recovery_state }}"
+
+    - name: Wait for a running repair before changing application containers
+      ansible.builtin.command: "systemctl is-active certlocker-{{ uncloud_company }}-ha.service"
+      register: uncloud_repair_status
+      changed_when: false
+      failed_when: false
+      until: uncloud_repair_status.stdout | trim in ['inactive', 'failed']
+      retries: 180
+      delay: 5
+      when: uncloud_recovery_state == 'stopped'

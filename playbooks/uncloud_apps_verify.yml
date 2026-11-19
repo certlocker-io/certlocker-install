@@ -1,0 +1,34 @@
+---
+- name: Verify the company application release on both private nodes
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Install the non-secret pinned manifest for independent verification
+      ansible.builtin.copy:
+        src: "{{ uncloud_manifest_source | default(inventory_dir ~ '/release.json') }}"
+        dest: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps/release.json"
+        mode: '0600'
+
+    - name: Verify exact images, HTTP health, UI readiness and Router registration
+      ansible.builtin.script:
+        cmd: >-
+          ops/files/uncloud_apps_verify.py
+          --company {{ uncloud_company }}
+          --mesh-ip {{ uncloud_mesh_ip }}
+          --router-ip current
+          --peer-ip {{ hostvars[(groups['uncloud'] | difference([inventory_hostname]) | first)].uncloud_mesh_ip }}
+          --manifest /opt/certlocker/{{ uncloud_company }}/uncloud-apps/release.json
+          {{ '--primary' if inventory_hostname == groups['uncloud'][0] else '' }}
+        executable: /usr/bin/python3
+      changed_when: false
+      register: uncloud_app_verification
+      retries: 3
+      delay: 3
+      until: uncloud_app_verification.rc != 75
+      failed_when: uncloud_app_verification.rc != 0
+
+    - name: Report sanitized application verification
+      ansible.builtin.debug:
+        msg: "{{ uncloud_app_verification.stdout | trim | from_json }}"

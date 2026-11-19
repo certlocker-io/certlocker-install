@@ -1,0 +1,53 @@
+---
+- name: Verify database roles and replication after installation or failover
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Require the Uncloud pair and mesh addresses
+      ansible.builtin.assert:
+        that:
+          - uncloud_deployment in ['dev', 'prod']
+          - inventory_hostname in [groups['uncloud'][0], groups['uncloud'][1]]
+          - uncloud_mesh_ip is match('^10\.210\.[0-9]+\.[0-9]+$')
+
+    - name: Read actual database roles without reading credentials into the controller
+      ansible.builtin.shell: |
+        docker exec certlocker-uncloud-postgres bash -ec '
+          export PGPASSWORD="$(cat /run/lab-secrets/postgres)" PGSSLMODE=require
+          exec psql -h 127.0.0.1 -U postgres -d postgres -At -c "SELECT pg_is_in_recovery()"'
+      register: uncloud_db_role
+      changed_when: false
+
+    - name: Verify the elected writer first then its standby
+      run_once: true
+      block:
+        - name: Require exactly one writable primary
+          ansible.builtin.assert:
+            that:
+              - "[hostvars[groups['uncloud'][0]].uncloud_db_role.stdout | trim, hostvars[groups['uncloud'][1]].uncloud_db_role.stdout | trim] | sort == ['f', 't']"
+
+        - name: Record elected roles and a public synthetic replication marker
+          ansible.builtin.set_fact:
+            uncloud_db_primary: "{{ groups['uncloud'][0] if hostvars[groups['uncloud'][0]].uncloud_db_role.stdout | trim == 'f' else groups['uncloud'][1] }}"
+            uncloud_db_standby: "{{ groups['uncloud'][1] if hostvars[groups['uncloud'][0]].uncloud_db_role.stdout | trim == 'f' else groups['uncloud'][0] }}"
+            uncloud_probe_id: "{{ lookup('pipe', 'python3 -c \"import uuid; print(uuid.uuid4())\"') }}"
+
+        - name: Verify bindings Pgpool roles TLS replication and the synthetic row
+          ansible.builtin.script:
+            cmd: >-
+              ops/files/uncloud_verify.py --node {{ item }} --primary-node {{ uncloud_db_primary }}
+              --mesh-ip {{ hostvars[item].uncloud_mesh_ip }} --probe {{ uncloud_probe_id }}
+            executable: /usr/bin/python3
+          delegate_to: "{{ item }}"
+          loop: "{{ [uncloud_db_primary, uncloud_db_standby] }}"
+          register: uncloud_database_result
+          changed_when: item == uncloud_db_primary
+
+        - name: Report sanitized database verification
+          ansible.builtin.debug:
+            msg: "{{ item.stdout | trim | from_json }}"
+          loop: "{{ uncloud_database_result.results }}"
+          loop_control:
+            label: "{{ item.item }}"

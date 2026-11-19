@@ -1,0 +1,100 @@
+---
+- name: Require external key protection for customer Google installations
+  ansible.builtin.assert:
+    that:
+      - uncloud_runtime_backend | default('host') in ['host', 'gcp-kms']
+      - uncloud_registry_mode | default('ghcr') != 'gcp' or uncloud_runtime_backend | default('host') == 'gcp-kms'
+
+- name: Install envelope encryption support
+  ansible.builtin.apt:
+    name: python3-cryptography
+    state: present
+  when: uncloud_runtime_backend | default('host') == 'gcp-kms'
+
+- name: Create the private non-secret runtime configuration directory
+  ansible.builtin.file:
+    path: "/etc/certlocker/{{ uncloud_company }}"
+    state: directory
+    mode: '0700'
+
+- name: Inspect the existing encryption configuration
+  ansible.builtin.stat:
+    path: "/etc/certlocker/{{ uncloud_company }}/runtime.json"
+  register: uncloud_runtime_config_stat
+
+- name: Read existing non-secret encryption identity settings
+  ansible.builtin.slurp:
+    src: "/etc/certlocker/{{ uncloud_company }}/runtime.json"
+  register: uncloud_runtime_config_payload
+  when: uncloud_runtime_config_stat.stat.exists
+
+- name: Refuse implicit encryption backend or key changes on repeat setup
+  ansible.builtin.assert:
+    that:
+      - "(uncloud_runtime_config_payload.content | b64decode | from_json) == {'backend': uncloud_runtime_backend | default('host'), 'kms_key': uncloud_kms_key | default(''), 'service_account': uncloud_registry_service_account | default('')}"
+    fail_msg: Existing runtime encryption identity must be preserved; key migration requires an explicit reseal procedure.
+  when: uncloud_runtime_config_stat.stat.exists
+
+- name: Configure runtime encryption without storing an encryption key
+  ansible.builtin.copy:
+    dest: "/etc/certlocker/{{ uncloud_company }}/runtime.json"
+    mode: '0600'
+    content: "{{ {'backend': uncloud_runtime_backend | default('host'), 'kms_key': uncloud_kms_key | default(''), 'service_account': uncloud_registry_service_account | default('')} | to_json }}"
+
+- name: Install Google identity and KMS operations
+  ansible.builtin.copy:
+    src: ops/files/uncloud_gcp.py
+    dest: /usr/local/sbin/uncloud_gcp.py
+    mode: '0755'
+
+- name: Install the bounded encrypted runtime credential helper
+  ansible.builtin.copy:
+    src: ops/files/uncloud_runtime_secrets.py
+    dest: /usr/local/sbin/certlocker-uncloud-runtime
+    mode: '0755'
+
+- name: Seal current runtime values to this machine without persisting the API token
+  ansible.builtin.command: "/usr/local/sbin/certlocker-uncloud-runtime seal --company {{ uncloud_company }}"
+  no_log: true
+
+- name: Install boot-time runtime secret restoration
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/certlocker-{{ uncloud_company }}-runtime.service"
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Restore CertLocker runtime credentials from host-encrypted storage
+      After=local-fs.target network-online.target
+      Wants=network-online.target
+      Before=docker.service
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      UMask=0077
+      LimitCORE=0
+      ExecStart=/usr/local/sbin/certlocker-uncloud-runtime restore --company {{ uncloud_company }}
+      TimeoutStartSec=180
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Create the Docker boot dependency directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/docker.service.d
+    state: directory
+    mode: '0755'
+
+- name: Require runtime credentials before Docker starts restored containers
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/docker.service.d/certlocker-{{ uncloud_company }}-runtime.conf"
+    mode: '0644'
+    content: |
+      [Unit]
+      Requires=certlocker-{{ uncloud_company }}-runtime.service
+      After=certlocker-{{ uncloud_company }}-runtime.service
+
+- name: Enable and verify credential restoration without restarting Docker
+  ansible.builtin.systemd_service:
+    name: "certlocker-{{ uncloud_company }}-runtime.service"
+    enabled: true
+    daemon_reload: true
+    state: started

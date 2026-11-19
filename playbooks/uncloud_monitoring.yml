@@ -1,0 +1,236 @@
+---
+- name: Install or update only the selected monitoring components
+  hosts: uncloud
+  serial: 1
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    monitoring_root: "/opt/certlocker/{{ uncloud_company }}/uncloud-monitoring"
+    monitoring_runtime: "/run/certlocker/{{ uncloud_company }}/monitoring"
+    monitoring_central: "{{ groups['uncloud'] | first }}"
+    monitoring_all: [node-exporter, cadvisor, postgres-exporter, alertmanager, google-chat-alerts, prometheus, loki, alloy, grafana]
+    uncloud_google_chat_alerts_enabled: "{{ (vault_noc_google_chat_webhook_url | default('') | string | trim | length) > 0 }}"
+    monitoring_requested: "{{ uncloud_monitoring_selected | default(monitoring_all) }}"
+    monitoring_central_services: "{{ ['alertmanager', 'prometheus', 'loki', 'grafana'] + (['google-chat-alerts'] if uncloud_google_chat_alerts_enabled else []) }}"
+    monitoring_node_services: "{{ ['node-exporter', 'cadvisor', 'postgres-exporter', 'alloy'] + (monitoring_central_services if inventory_hostname == monitoring_central else []) }}"
+    monitoring_selected: "{{ monitoring_requested | intersect(monitoring_node_services) }}"
+    uncloud_monitoring_images: "{{ lookup('file', '../uncloud/monitoring/images.json') | from_json }}"
+  tasks:
+    - name: Require a bounded monitoring selection
+      ansible.builtin.assert:
+        that:
+          - monitoring_requested | length > 0
+          - monitoring_requested | difference(monitoring_all) | length == 0
+
+    - name: Skip hosts with no selected monitoring components
+      ansible.builtin.meta: end_host
+      when: monitoring_selected | length == 0
+
+    - name: Require selected credentials to be populated
+      ansible.builtin.assert:
+        that:
+          - "'grafana' not in monitoring_selected or vault_grafana_admin_password | default('') | length > 0"
+          - "'postgres-exporter' not in monitoring_selected or vault_certlocker_postgres_password | default('') | length > 0"
+          - "'google-chat-alerts' not in monitoring_selected or vault_noc_google_chat_webhook_url | default('') | length > 0"
+          - "not uncloud_google_chat_alerts_enabled or vault_noc_google_chat_webhook_url is match('^https://chat\\.googleapis\\.com/v1/spaces/[^/]+/messages\\?')"
+      no_log: true
+
+    - name: Capture all container identities before the monitoring deployment
+      ansible.builtin.command:
+        argv: [docker, ps, -a, --no-trunc, --format, '{% raw %}{{.Names}} {{.ID}}{% endraw %}']
+      register: monitoring_before
+      changed_when: false
+
+    - name: Create protected monitoring configuration directories
+      ansible.builtin.file:
+        path: "{{ monitoring_root }}/{{ item }}"
+        state: directory
+        mode: '0700'
+      loop: ['']
+
+    - name: Save the current monitoring image pins for safe rollback and pruning
+      ansible.builtin.copy:
+        src: ../uncloud/monitoring/images.json
+        dest: "{{ monitoring_root }}/images.json"
+        mode: '0644'
+
+    - name: Create memory-backed monitoring credential directory
+      ansible.builtin.file:
+        path: "{{ monitoring_runtime }}"
+        state: directory
+        mode: '0700'
+
+    - name: Verify monitoring credentials are on tmpfs
+      ansible.builtin.command: "findmnt -n -o FSTYPE -T {{ monitoring_runtime }}"
+      register: monitoring_runtime_filesystem
+      changed_when: false
+      failed_when: monitoring_runtime_filesystem.stdout | trim != 'tmpfs'
+
+    - name: Install only the selected monitoring credentials from company Trust
+      ansible.builtin.copy:
+        dest: "{{ monitoring_runtime }}/{{ item.name }}"
+        content: "{{ item.value }}"
+        owner: "{{ item.owner }}"
+        group: '0'
+        mode: '0400'
+      loop:
+        - {name: postgres, value: "{{ vault_certlocker_postgres_password | default('') }}", owner: '65534', service: postgres-exporter}
+        - {name: grafana_admin_password, value: "{{ vault_grafana_admin_password | default('') }}", owner: '472', service: grafana}
+        - {name: google_chat_webhook_url, value: "{{ vault_noc_google_chat_webhook_url | default('') }}", owner: '0', service: google-chat-alerts}
+      when: item.service in monitoring_selected
+      no_log: true
+      register: monitoring_credentials
+
+    - name: Install the Google Chat Alertmanager adapter
+      ansible.builtin.copy:
+        src: ../uncloud/monitoring/google_chat_webhook.py
+        dest: "{{ monitoring_root }}/google_chat_webhook.py"
+        mode: '0644'
+      when: "'google-chat-alerts' in monitoring_selected"
+      register: monitoring_chat_adapter
+
+    - name: Seal monitoring credentials before changing containers
+      ansible.builtin.import_tasks: uncloud_runtime_tasks.yml
+
+    - name: Render monitoring Compose and scrape configuration
+      ansible.builtin.template:
+        src: "../uncloud/monitoring/{{ item }}.j2"
+        dest: "{{ monitoring_root }}/{{ item }}"
+        mode: '0644'
+      loop: [compose.yaml, prometheus.yml]
+      when: item == 'compose.yaml' or 'prometheus' in monitoring_selected
+      register: monitoring_compose_configuration
+
+    - name: Install the Loki retention and Alloy Docker log collection configs
+      ansible.builtin.template:
+        src: "../uncloud/monitoring/{{ item.src }}"
+        dest: "{{ monitoring_root }}/{{ item.dest }}"
+        mode: '0644'
+      loop:
+        - {src: loki-config.yaml.j2, dest: loki-config.yaml, service: loki}
+        - {src: alloy.config.alloy.j2, dest: alloy.config.alloy, service: alloy}
+      when: item.service in monitoring_selected
+      register: monitoring_log_configuration
+
+    - name: Configure the local Prometheus Grafana data source
+      ansible.builtin.copy:
+        dest: "{{ monitoring_root }}/datasources.yml"
+        mode: '0644'
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Prometheus
+              type: prometheus
+              access: proxy
+              url: http://{{ hostvars[monitoring_central].uncloud_mesh_ip }}:9090/prometheus/
+              isDefault: true
+              editable: false
+            - name: Loki
+              type: loki
+              access: proxy
+              url: http://{{ hostvars[monitoring_central].uncloud_mesh_ip }}:3100
+              editable: false
+
+      when: "'grafana' in monitoring_selected"
+      register: monitoring_datasource_configuration
+
+    - name: Install basic availability alert rules
+      ansible.builtin.copy:
+        dest: "{{ monitoring_root }}/rules.yml"
+        mode: '0644'
+        content: |
+          groups:
+            - name: infrastructure
+              rules:
+                - alert: ScrapeTargetDown
+                  expr: up == 0
+                  for: 1m
+                  labels: {severity: critical}
+                - alert: PostgreSQLUnavailable
+                  expr: pg_up == 0
+                  for: 30s
+                  labels: {severity: critical}
+
+      when: "'prometheus' in monitoring_selected"
+      register: monitoring_rule_configuration
+
+    - name: Install Alertmanager routing (Google Chat when the company webhook is enrolled)
+      ansible.builtin.template:
+        src: ../uncloud/monitoring/alertmanager.yml.j2
+        dest: "{{ monitoring_root }}/alertmanager.yml"
+        mode: '0644'
+      when: "'alertmanager' in monitoring_selected"
+      register: monitoring_alert_configuration
+
+    - name: Validate monitoring Compose
+      ansible.builtin.command:
+        cmd: docker compose config --quiet
+        chdir: "{{ monitoring_root }}"
+      changed_when: false
+
+    - name: Pull only the selected monitoring images
+      ansible.builtin.command:
+        cmd: "docker compose pull --quiet {{ monitoring_selected | join(' ') }}"
+        chdir: "{{ monitoring_root }}"
+
+    - name: Start only selected monitoring components without dependencies
+      ansible.builtin.command:
+        cmd: >-
+          docker compose up -d --no-deps --pull never
+          {{ '--force-recreate' if (uncloud_monitoring_recreate | default(false) | bool or
+             monitoring_credentials.changed or monitoring_compose_configuration.changed or
+             monitoring_log_configuration.changed or monitoring_datasource_configuration.changed or
+             monitoring_rule_configuration.changed or monitoring_alert_configuration.changed or
+             (monitoring_chat_adapter is defined and monitoring_chat_adapter.changed)) else '' }}
+          {{ monitoring_selected | join(' ') }}
+        chdir: "{{ monitoring_root }}"
+
+    - name: Verify selected monitoring HTTP endpoints
+      ansible.builtin.uri:
+        url: "http://{{ uncloud_mesh_ip if item.service in ['node-exporter', 'cadvisor', 'postgres-exporter', 'loki', 'grafana'] else hostvars[monitoring_central].uncloud_mesh_ip if item.service == 'prometheus' else '127.0.0.1' }}:{{ item.port }}{{ item.path }}"
+        status_code: 200
+      loop:
+        - {service: node-exporter, port: 9100, path: /metrics}
+        - {service: cadvisor, port: 8080, path: /metrics}
+        - {service: postgres-exporter, port: 9187, path: /metrics}
+        - {service: google-chat-alerts, port: 9094, path: /health}
+        - {service: alertmanager, port: 9093, path: /-/ready}
+        - {service: prometheus, port: 9090, path: /prometheus/-/ready}
+        - {service: loki, port: 3100, path: /ready}
+        - {service: alloy, port: 12345, path: /-/ready}
+        - {service: grafana, port: 3001, path: /api/health}
+      when: item.service in monitoring_selected
+      register: monitoring_endpoint
+      until: monitoring_endpoint.status | default(0) == 200
+      retries: 30
+      delay: 3
+
+    - name: Capture all container identities after the monitoring deployment
+      ansible.builtin.command:
+        argv: [docker, ps, -a, --no-trunc, --format, '{% raw %}{{.Names}} {{.ID}}{% endraw %}']
+      register: monitoring_after
+      changed_when: false
+
+    - name: Require the mesh-bound cAdvisor health check to pass
+      ansible.builtin.command:
+        argv: [docker, inspect, --format, '{% raw %}{{.State.Health.Status}}{% endraw %}', certlocker-cadvisor]
+      register: monitoring_cadvisor_health
+      changed_when: false
+      until: monitoring_cadvisor_health.stdout | trim == 'healthy'
+      retries: 12
+      delay: 3
+      when: "'cadvisor' in monitoring_selected"
+
+    - name: Require every unselected container to keep its identity
+      ansible.builtin.assert:
+        that: item in monitoring_after.stdout_lines
+      loop: "{{ monitoring_before.stdout_lines }}"
+      when: item.split(' ')[0] not in (monitoring_selected | map('regex_replace', '^', 'certlocker-') | list)
+
+    - name: Remove the obsolete plaintext monitoring credential directory
+      ansible.builtin.file:
+        path: "{{ monitoring_root }}/secrets"
+        state: absent
+      when: monitoring_selected | sort == monitoring_all | sort
+      no_log: true

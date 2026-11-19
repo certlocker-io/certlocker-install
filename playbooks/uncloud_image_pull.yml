@@ -1,0 +1,52 @@
+---
+- name: Create a temporary memory-backed Docker authentication directory
+  ansible.builtin.tempfile:
+    path: /dev/shm
+    state: directory
+    prefix: certlocker-pull-
+  register: uncloud_pull_auth
+
+- name: Pull the approved images with bounded authentication lifetime
+  block:
+    - name: Verify the authentication directory is memory backed
+      ansible.builtin.command: "findmnt -n -o FSTYPE -T {{ uncloud_pull_auth.path }}"
+      register: uncloud_pull_filesystem
+      changed_when: false
+      failed_when: uncloud_pull_filesystem.stdout | trim != 'tmpfs'
+
+    - name: Authenticate GHCR pulls only in memory
+      ansible.builtin.command:
+        argv: [docker, login, ghcr.io, -u, "{{ vault_certlocker_application_settings.ghcr_username }}", --password-stdin]
+        stdin: "{{ vault_cr_pat }}"
+      environment:
+        DOCKER_CONFIG: "{{ uncloud_pull_auth.path }}"
+      when: uncloud_registry_mode | default('ghcr') == 'ghcr'
+      changed_when: false
+      no_log: true
+
+    - name: Pull immutable images using temporary authentication or VM identity
+      ansible.builtin.command:
+        argv: "{{ uncloud_pull_argv }}"
+        chdir: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps"
+      environment:
+        DOCKER_CONFIG: "{{ '/root/.docker' if uncloud_registry_mode | default('ghcr') == 'gcp' else uncloud_pull_auth.path }}"
+      # Pulling several large images can outlive a reliable SSH session on a
+      # newly provisioned disk. Poll one bounded remote job instead of keeping
+      # its download tied to the original transport connection.
+      async: 1800
+      poll: 10
+      vars:
+        ansible_ssh_retries: 3
+      changed_when: false
+  always:
+    - name: Remove temporary registry authentication even if a pull fails
+      ansible.builtin.file:
+        path: "{{ uncloud_pull_auth.path }}"
+        state: absent
+      no_log: true
+
+    - name: Remove any legacy persistent GHCR login on installation nodes
+      ansible.builtin.command: docker logout ghcr.io
+      when: uncloud_registry_mode | default('ghcr') == 'ghcr'
+      changed_when: false
+      no_log: true

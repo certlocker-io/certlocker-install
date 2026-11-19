@@ -1,0 +1,14 @@
+{
+  "node_type": "BACKOFFICE",
+  "required_nodes": ["DATASERVICE"],
+  "registra_port": 40905,
+  "event_bus_config": {"threads": "5", "repository_location": "${ApplicationRepository:repo}"},
+  "cache_groups": ["SYSTEM"],
+  "router_client_config": {
+    "url": "${ApplicationRouter:http://localhost:9000}",
+    "registra_address": "${ApplicationRegistra:localhost:40905}",
+    "http_client_config": {"io_threads": 5, "max_connections": 12, "connect_timeout": 2000, "socket_timeout": 300000}
+  },
+  "session_config": {"session_timeout": "2h", "password_reset_timeout": "6h", "session_renew": "10m", "idle_timeout": "10m", "validation_link_duration": "8m"},
+  "domain": {{ uncloud_company | to_json }}
+}

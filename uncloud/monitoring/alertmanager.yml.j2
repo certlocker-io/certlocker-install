@@ -1,0 +1,24 @@
+# Rendered for {{ uncloud_company }}. Webhook secret stays in Trust / tmpfs only.
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: {{ 'noc-google-chat' if uncloud_google_chat_alerts_enabled else 'local' }}
+  group_by: [alertname, company, node]
+  group_wait: 30s
+  group_interval: 1m
+  repeat_interval: 1h
+  routes:
+    - matchers:
+        - severity = "info"
+      receiver: local
+      continue: false
+
+receivers:
+  - name: local
+{% if uncloud_google_chat_alerts_enabled %}
+  - name: noc-google-chat
+    webhook_configs:
+      - send_resolved: true
+        url: http://127.0.0.1:9094/alerts
+{% endif %}

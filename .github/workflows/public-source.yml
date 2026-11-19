@@ -1,0 +1,17 @@
+name: Public installer checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 tools/check-public-files.py
+      - run: python3 -m pip install -r controller/requirements.txt
+      - run: python3 -m unittest discover -s tests -v
+      - name: Scan public source for credentials
+        run: docker run --rm -v "$PWD:/source:ro" ghcr.io/gitleaks/gitleaks:v8.24.3 dir /source --redact --no-banner

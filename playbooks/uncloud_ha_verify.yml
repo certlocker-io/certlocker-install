@@ -1,0 +1,152 @@
+---
+- name: Verify installed recovery monitoring and HTTPS origins
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    monitoring_central: "{{ groups['uncloud'] | first }}"
+    uncloud_ui_hostnames: "{{ [uncloud_ingress_settings.hostname, uncloud_ingress_settings.backoffice_hostname] }}"
+  tasks:
+    - name: Read whether this installation uses a single API owner
+      ansible.builtin.command:
+        argv:
+          - grep
+          - -qx
+          - HA_API_SINGLE_OWNER=1
+          - "/opt/certlocker/{{ uncloud_company }}/uncloud-apps/.env"
+      register: uncloud_verify_owner_mode
+      changed_when: false
+      failed_when: uncloud_verify_owner_mode.rc not in [0, 1]
+
+    - name: Require the API owner supervisor to be active and enabled
+      ansible.builtin.command: "systemctl {{ item }} certlocker-{{ uncloud_company }}-api-owner.service"
+      loop: [is-active, is-enabled]
+      when: uncloud_verify_owner_mode.rc == 0
+      changed_when: false
+
+    - name: Require recovery timers and boot credential restoration to be active
+      ansible.builtin.command: "systemctl is-active {{ item }}"
+      loop:
+        - "certlocker-{{ uncloud_company }}-ha.timer"
+        - "certlocker-{{ uncloud_company }}-runtime.service"
+      changed_when: false
+
+    - name: Require recovery timers and boot credential restoration to be enabled
+      ansible.builtin.command: "systemctl is-enabled {{ item }}"
+      loop:
+        - "certlocker-{{ uncloud_company }}-ha.timer"
+        - "certlocker-{{ uncloud_company }}-runtime.service"
+      changed_when: false
+
+    - name: Check the encrypted boot credential cache without reading it
+      ansible.builtin.stat:
+        path: "/var/lib/certlocker/{{ uncloud_company }}/runtime.cred"
+      register: uncloud_boot_cache
+
+    - name: Require a private root-owned encrypted cache
+      ansible.builtin.assert:
+        that:
+          - uncloud_boot_cache.stat.isreg | default(false)
+          - uncloud_boot_cache.stat.uid == 0
+          - uncloud_boot_cache.stat.mode == '0600'
+
+    - name: Verify current origin certificate hostname and real readiness through HTTPS
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --fail
+          - --silent
+          - --show-error
+          - --max-time
+          - '15'
+          - --resolve
+          - "{{ item }}:443:127.0.0.1"
+          - "https://{{ item }}/health/ready"
+      loop: "{{ uncloud_ui_hostnames }}"
+      register: uncloud_origin_probe
+      changed_when: false
+      failed_when: uncloud_origin_probe.rc != 0 or uncloud_origin_probe.stdout | trim != 'ready'
+
+    - name: Verify installed monitoring readiness
+      ansible.builtin.uri:
+        url: "http://{{ hostvars[monitoring_central].uncloud_mesh_ip if item.port in [9090, 3001] else '127.0.0.1' }}:{{ item.port }}{{ item.path }}"
+        status_code: 200
+      loop:
+        - {port: 9090, path: /prometheus/-/ready}
+        - {port: 9093, path: /-/ready}
+        - {port: 3001, path: /api/health}
+      when: inventory_hostname == monitoring_central
+
+    - name: Verify public HTTP reaches each origin and redirects to HTTPS
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}/health/ready"
+        headers:
+          Host: "{{ uncloud_ingress_settings.hostname }}"
+        follow_redirects: none
+        use_proxy: false
+        status_code: 308
+        timeout: 15
+      register: uncloud_public_http
+      failed_when: >-
+        uncloud_public_http.status | default(0) != 308 or
+        uncloud_public_http.location | default('') != 'https://' ~ uncloud_ingress_settings.hostname ~ '/health/ready'
+      delegate_to: localhost
+      become: false
+
+    - name: Verify both UI names through each public HTTPS origin
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --fail
+          - --silent
+          - --show-error
+          - --noproxy
+          - '*'
+          - --max-time
+          - '15'
+          - --resolve
+          - "{{ item }}:443:{{ ansible_host }}"
+          - "https://{{ item }}/health/ready"
+      loop: "{{ uncloud_ui_hostnames }}"
+      register: uncloud_public_https
+      changed_when: false
+      failed_when: uncloud_public_https.rc != 0 or uncloud_public_https.stdout | trim != 'ready'
+      delegate_to: localhost
+      become: false
+
+    - name: Verify Grafana rejects a controller outside the monitoring VPN allowlist
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --noproxy
+          - '*'
+          - --max-time
+          - '15'
+          - --output
+          - /dev/null
+          - --write-out
+          - '%{http_code}'
+          - --resolve
+          - "{{ uncloud_ingress_settings.grafana_hostname }}:443:{{ ansible_host }}"
+          - "https://{{ uncloud_ingress_settings.grafana_hostname }}/api/health"
+      register: uncloud_grafana_denied
+      changed_when: false
+      failed_when: uncloud_grafana_denied.rc != 0 or uncloud_grafana_denied.stdout | trim != '403'
+      when: uncloud_operator_cidrs | intersect(uncloud_vpn_cidrs) | length == 0
+      delegate_to: localhost
+      become: false
+
+    - name: Verify all private exporter targets are scraped successfully
+      ansible.builtin.uri:
+        url: 'http://{{ hostvars[monitoring_central].uncloud_mesh_ip }}:9090/prometheus/api/v1/targets'
+        return_content: true
+      register: uncloud_scrape_targets
+      until: >-
+        uncloud_scrape_targets.json.data.activeTargets | default([]) | length >= 7 and
+        uncloud_scrape_targets.json.data.activeTargets | selectattr('health', 'ne', 'up') | list | length == 0
+      retries: 12
+      delay: 5
+      when: inventory_hostname == monitoring_central

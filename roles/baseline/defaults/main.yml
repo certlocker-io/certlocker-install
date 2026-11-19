@@ -1,0 +1,9 @@
+---
+baseline_sudo_nopasswd_users: []
+baseline_authorized_keys: []
+# Cloud VMs can retain their provider resolver for metadata/internal DNS.
+baseline_manage_resolv_conf: true
+# Required Java version (e.g. 25). When set, no fallback to older JDK; use manual install if Adoptium repo unreachable.
+baseline_java_version_required: 25
+# Fallback package only used when baseline_java_version_required is not set and Adoptium repo fails.
+baseline_java_fallback_package: openjdk-25-jdk

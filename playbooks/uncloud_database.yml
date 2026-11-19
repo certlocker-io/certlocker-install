@@ -1,0 +1,288 @@
+---
+- name: Prepare isolated PostgreSQL identities and configuration
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    db_root: /opt/certlocker/uncloud-db
+    identity_path: /var/lib/certlocker-uncloud/identity.json
+    identity_fingerprint: /var/lib/certlocker-uncloud/identity.sha256
+    database_runtime: "/run/certlocker/{{ uncloud_company }}/database"
+  tasks:
+    - name: Require both Uncloud nodes and explicit mesh addresses
+      ansible.builtin.assert:
+        that:
+          - groups['uncloud'] | sort == [groups['uncloud'][0], groups['uncloud'][1]]
+          - uncloud_deployment in ['dev', 'prod']
+          - uncloud_mesh_ip is match('^10\.210\.[0-9]+\.[0-9]+$')
+          - inventory_hostname in [groups['uncloud'][0], groups['uncloud'][1]]
+
+    - name: Check whether a database volume already exists
+      ansible.builtin.command: docker volume inspect --format '{{ '{{' }}.Mountpoint{{ '}}' }}' certlocker-uncloud-db_postgres_repmgr_data
+      register: uncloud_db_volume
+      changed_when: false
+      failed_when: uncloud_db_volume.rc not in [0, 1]
+
+    - name: Check the existing Uncloud identity without reading values
+      ansible.builtin.stat:
+        path: "{{ identity_path }}"
+      register: uncloud_identity_stat
+      delegate_to: "{{ groups['uncloud'][0] }}"
+      run_once: true
+
+    - name: Check the non-secret database continuity fingerprint
+      ansible.builtin.stat:
+        path: "{{ identity_fingerprint }}"
+      register: uncloud_identity_fingerprint_stat
+      delegate_to: "{{ groups['uncloud'][0] }}"
+      run_once: true
+
+    - name: Refuse fresh credentials if either database already exists
+      ansible.builtin.assert:
+        that:
+          - uncloud_identity_stat.stat.exists or uncloud_identity_fingerprint_stat.stat.exists or (hostvars[groups['uncloud'][0]].uncloud_db_volume.rc != 0 and hostvars[groups['uncloud'][1]].uncloud_db_volume.rc != 0)
+        fail_msg: Existing database data requires its original Uncloud identity; never regenerate credentials over it.
+      run_once: true
+
+    - name: Resolve the durable database identity from company Trust
+      ansible.builtin.set_fact:
+        uncloud_identity: "{{ vault_certlocker_database_identity }}"
+      no_log: true
+
+    - name: Verify identity matches mesh and database credentials
+      ansible.builtin.assert:
+        that:
+          - uncloud_identity.addresses[inventory_hostname] == uncloud_mesh_ip
+          - uncloud_identity.passwords.postgres == vault_certlocker_postgres_password
+          - uncloud_identity.passwords.repmgr == vault_certlocker_repmgr_password
+          - uncloud_identity.passwords.pgpool == vault_certlocker_pgpool_admin_password
+      no_log: true
+
+    - name: Create private identity cache directory
+      ansible.builtin.file:
+        path: /var/lib/certlocker-uncloud
+        state: directory
+        mode: '0700'
+
+    - name: Read existing identity for continuity verification
+      ansible.builtin.slurp:
+        src: "{{ identity_path }}"
+      register: existing_identity
+      delegate_to: "{{ groups['uncloud'][0] }}"
+      run_once: true
+      when: uncloud_identity_stat.stat.exists
+      no_log: true
+
+    - name: Refuse replacement of an existing database identity
+      ansible.builtin.assert:
+        that:
+          - (existing_identity.content | b64decode | from_json).nodes == uncloud_identity.nodes
+          - (existing_identity.content | b64decode | from_json).passwords == uncloud_identity.passwords
+      when: uncloud_identity_stat.stat.exists
+      run_once: true
+      no_log: true
+
+    - name: Read the existing continuity fingerprint without loading private keys
+      ansible.builtin.slurp:
+        src: "{{ identity_fingerprint }}"
+      register: existing_identity_fingerprint
+      delegate_to: "{{ groups['uncloud'][0] }}"
+      run_once: true
+      when: uncloud_identity_fingerprint_stat.stat.exists
+      no_log: true
+
+    - name: Require database identity continuity
+      ansible.builtin.assert:
+        that:
+          - "existing_identity_fingerprint.content | b64decode | trim == ({'nodes': uncloud_identity.nodes, 'passwords': uncloud_identity.passwords} | to_json(sort_keys=true) | hash('sha256'))"
+      when: uncloud_identity_fingerprint_stat.stat.exists
+      no_log: true
+
+    - name: Save only the database identity continuity fingerprint
+      ansible.builtin.copy:
+        dest: "{{ identity_fingerprint }}"
+        content: "{{ {'nodes': uncloud_identity.nodes, 'passwords': uncloud_identity.passwords} | to_json(sort_keys=true) | hash('sha256') }}\n"
+        mode: '0600'
+      no_log: true
+
+    - name: Create the memory-backed database credential root
+      ansible.builtin.file:
+        path: "{{ database_runtime }}"
+        state: directory
+        mode: '0700'
+
+    - name: Require database credentials to reside on tmpfs
+      ansible.builtin.command: "findmnt -n -o FSTYPE -T {{ database_runtime }}"
+      register: database_runtime_filesystem
+      changed_when: false
+      failed_when: database_runtime_filesystem.stdout | trim != 'tmpfs'
+
+    - name: Create root-only deployment directory
+      ansible.builtin.file:
+        path: "{{ db_root }}"
+        state: directory
+        mode: '0700'
+
+    - name: Create container-readable mount directories
+      ansible.builtin.file:
+        path: "{{ database_runtime }}/{{ item }}"
+        state: directory
+        owner: '1001'
+        group: '0'
+        mode: '0750'
+      loop: [secrets, certs]
+
+    - name: Install private password files for the images' FILE interfaces
+      ansible.builtin.copy:
+        dest: "{{ database_runtime }}/secrets/{{ item }}"
+        content: "{{ uncloud_identity.passwords[item] }}"
+        owner: '1001'
+        group: '0'
+        mode: '0400'
+      loop: [postgres, repmgr, pgpool]
+      no_log: true
+
+    - name: Install this node's TLS identity only
+      ansible.builtin.copy:
+        dest: "{{ database_runtime }}/certs/{{ item.name }}"
+        content: "{{ item.content }}"
+        owner: '1001'
+        group: '0'
+        mode: '0400'
+      loop:
+        - {name: server.crt, content: "{{ uncloud_identity.nodes[inventory_hostname].certificate }}"}
+        - {name: server.key, content: "{{ uncloud_identity.nodes[inventory_hostname].key }}"}
+        - {name: ca.crt, content: "{{ uncloud_identity.ca }}"}
+      no_log: true
+
+    - name: Seal database credentials and install boot restoration before starting containers
+      ansible.builtin.import_tasks: uncloud_runtime_tasks.yml
+
+    - name: Require a live writer before a returning database chooses its role
+      ansible.builtin.copy:
+        src: ops/files/uncloud_database_start.sh
+        dest: "{{ db_root }}/database-start.sh"
+        mode: '0755'
+
+    - name: Render database-only Compose with private host bindings
+      ansible.builtin.template:
+        src: ../uncloud/database/compose.yaml.j2
+        dest: "{{ db_root }}/compose.yaml"
+        mode: '0600'
+
+    - name: Remove the unused authentication override from the initial trial attempt
+      ansible.builtin.file:
+        path: "{{ db_root }}/conf/pg_hba.conf"
+        state: absent
+
+    - name: Validate Compose without expanding or printing secrets
+      ansible.builtin.command:
+        cmd: docker compose config --quiet
+        chdir: "{{ db_root }}"
+      changed_when: false
+
+    - name: Inspect actual network membership before reusing containers
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - '{{ "{{" }}json .NetworkSettings.Networks{{ "}}" }}'
+          - "certlocker-uncloud-{{ item }}"
+      loop: [postgres, pgpool]
+      register: uncloud_container_networks
+      changed_when: false
+      failed_when: uncloud_container_networks.rc not in [0, 1]
+
+    - name: Mark containers whose network must be corrected
+      ansible.builtin.set_fact:
+        uncloud_recreate_services: "{{ (uncloud_recreate_services | default([])) + [item.item] }}"
+      loop: "{{ uncloud_container_networks.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - item.rc == 0
+        - (item.stdout | from_json | list) != ['uncloud']
+
+- name: Start the initial PostgreSQL primary before the standby
+  hosts: "{{ groups['uncloud'][0] }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Start only the primary database
+      ansible.builtin.command:
+        cmd: "docker compose up -d {{ '--force-recreate' if 'postgres' in uncloud_recreate_services | default([]) else '' }} --wait --wait-timeout 300 postgres"
+        chdir: /opt/certlocker/uncloud-db
+      register: uncloud_primary_start
+      changed_when: "'Started' in uncloud_primary_start.stderr or 'Created' in uncloud_primary_start.stderr or 'Recreated' in uncloud_primary_start.stderr"
+
+- name: Start the PostgreSQL standby
+  hosts: "{{ groups['uncloud'][1] }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Start only the standby database
+      ansible.builtin.command:
+        cmd: "docker compose up -d {{ '--force-recreate' if 'postgres' in uncloud_recreate_services | default([]) else '' }} --wait --wait-timeout 300 postgres"
+        chdir: /opt/certlocker/uncloud-db
+      register: uncloud_standby_start
+      changed_when: "'Started' in uncloud_standby_start.stderr or 'Created' in uncloud_standby_start.stderr or 'Recreated' in uncloud_standby_start.stderr"
+
+- name: Start Pgpool only after both database nodes are healthy
+  hosts: uncloud
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Start the new Pgpool instances on loopback
+      ansible.builtin.command:
+        cmd: "docker compose up -d {{ '--force-recreate' if 'pgpool' in uncloud_recreate_services | default([]) else '' }} --wait --wait-timeout 180 pgpool"
+        chdir: /opt/certlocker/uncloud-db
+      register: uncloud_pgpool_start
+      changed_when: "'Started' in uncloud_pgpool_start.stderr or 'Created' in uncloud_pgpool_start.stderr or 'Recreated' in uncloud_pgpool_start.stderr"
+
+    - name: Install network-aware database startup helper
+      ansible.builtin.template:
+        src: ../uncloud/database/start-databases.sh.j2
+        dest: /usr/local/sbin/certlocker-uncloud-db-start
+        owner: root
+        group: root
+        mode: '0750'
+
+    - name: Order database startup after Docker and Uncloud
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/certlocker-uncloud-db.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=CertLocker isolated Uncloud PostgreSQL trial
+          Requires=docker.service uncloud.service
+          After=network-online.target docker.service uncloud.service
+          Wants=network-online.target
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/sbin/certlocker-uncloud-db-start
+          TimeoutStartSec=480
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable database startup after reboot
+      ansible.builtin.systemd_service:
+        name: certlocker-uncloud-db.service
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Remove obsolete plaintext credential caches after successful migration
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/certlocker-uncloud/identity.json
+        - /opt/certlocker/uncloud-db/secrets
+        - /opt/certlocker/uncloud-db/certs
+      no_log: true
