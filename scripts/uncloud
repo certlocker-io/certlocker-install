@@ -919,6 +919,15 @@ class Workflow:
         document = json.loads(self.tf('show', '-json', plan, capture=True))
         counts = validate_plan(document, self.config['google_project'], destroy, create_only=create_only)
         print('Validated isolated lab plan: ' + json.dumps(counts), flush=True)
+        if any(change['address'] == 'google_compute_network.lab' and change['change']['actions'] == ['create']
+               for change in document.get('resource_changes', [])):
+            quotas = json.loads(self.command(['gcloud', 'compute', 'project-info', 'describe',
+                                '--project', self.config['google_project'], '--format=json(quotas)'], capture=True))
+            for quota in quotas['quotas']:
+                if quota['metric'] == 'NETWORKS' and 0 <= quota['limit'] <= quota['usage']:
+                    raise ValueError('Google VPC network quota is full in ' + self.config['google_project'] +
+                                     '. Free a network slot or increase the quota before provisioning.')
+
         if destroy and getattr(self, 'remove_dns', False):
             addresses = {node: change['change']['before']['address']
                          for node in NAMES for change in document.get('resource_changes', [])
@@ -938,9 +947,12 @@ class Workflow:
             dns_evidence = {}
             api = Cloudflare(token)
             ingress = trust.get(trust_name(COMPANY, 'vault_certlocker_ingress_settings'))
-            if isinstance(ingress, dict) and ingress.get('grafana_hostname'):
-                dns_evidence['grafana_dns'] = remove_monitoring_dns(
-                    api, zone, COMPANY, ingress['grafana_hostname'])
+            grafana = ingress.get('grafana_hostname') if isinstance(ingress, dict) else None
+            if not grafana and self.config.get('grafana_url'):
+                from urllib.parse import urlsplit
+                grafana = urlsplit(self.config['grafana_url']).hostname
+            if grafana:
+                dns_evidence['grafana_dns'] = remove_monitoring_dns(api, zone, COMPANY, grafana)
             # Setup can fail after creating a monitor/pool but before active.json.
             # Discover exact owned resources on every explicit DNS teardown, including
             # older hashed pools left after hostname changes.
