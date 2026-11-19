@@ -13,13 +13,29 @@ The optional bare-metal readiness check uses the same Trust account ID and hidde
 
 ## Prepare the Trust installation
 
-Sign in to your customer account as a **super user**. Click your display name, open **User Details**, then select **Install setup** in the footer. The screenshots below use the instructional mock server and example data. [Open Trust](https://trust.certlocker.io)
+Sign in as a **super user**. Select your display name in the header to open **User Details**, then choose **Install setup** at the bottom left. The following screenshots use the mock server and example customer data. [Open Trust](https://trust.certlocker.io)
+
+<img src="images/install-account-menu.png" width="720" alt="Trust header with the signed-in user's display name">
+
+<details><summary>Find Install setup in User Details</summary>
+
+<img src="images/install-user-details.png" width="480" alt="User Details with the Install setup button in the footer">
+
+</details>
 
 1. **Name the installation and choose its type.** Choose **GENERIC** for existing machines or **GCP** for Google provisioning. The install name identifies the group containing your installation records.
 
    <img src="images/install-type.png" width="480" alt="Install setup with the north-site group and GENERIC selected">
 
 2. **Set up SSH access.** For GENERIC, enter the two distinct management IPv4 addresses your installer workstation uses to reach the machines over SSH. Enter the two short hostnames in the same order. Both GENERIC and GCP accept the Cloudflare zone, front-office URL, backoffice URL, Grafana URL and zone API token. In GCP the server hostnames name the VMs that Terraform creates. Enter the non-root username with passwordless sudo and upload its private key. Both machines must authorize the matching public key. For GCP, leave both SSH fields blank to generate a dedicated install key. To add your own public key to both Google VMs as well, supply its matching username and private key here.
+
+   Enter the Cloudflare zone as a domain, for example `example.org`. Each service needs a distinct HTTPS hostname directly under that zone, such as `https://app.example.org`. The grey examples are placeholders. Correct any mismatch before choosing **Next**.
+
+   <details><summary>DNS zone validation example</summary>
+
+   <img src="images/install-dns-validation.png" width="480" alt="An example.net front-office URL triggers a validation message for the example.org zone">
+
+   </details>
 
    <details><summary>SSH for existing machines</summary>
 

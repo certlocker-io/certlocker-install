@@ -106,7 +106,9 @@ and selects a packaged Linux controller when the native toolchain is incomplete.
 On macOS, complete any Homebrew, Docker Desktop, administrator and first-run
 prompts. Debian/Ubuntu can install Docker through the bootstrap; other Linux
 distributions need a Docker-compatible engine prepared by your administrator.
-Google browser login stays on your workstation.
+Google browser login stays on your workstation. Select the Google project where the VMs will run. Google setup needs one available project-wide VPC network slot for a fresh pair. If the project has reached its network quota, free a slot or increase the limit before retrying.
+
+When running GCP alongside bare metal, use a separate company slug and distinct service hostnames. Trust supplies the site settings from **User Details → Install setup → GCP**. For setup issued by a local Trust, run `./uncloudctl up --trust-url=http://localhost:8080/gateway/rest/api` and use the same Trust URL for later maintenance.
 
 To prepare the toolchain before installation, optionally run:
 
@@ -256,7 +258,7 @@ After verified teardown, the active inventory is archived under that run's
 `up --config` to install a fresh pair. Keep the original Install setup records and provide the initial administrator
 password again when running unattended after revoking deployment records.
 If a repeated `destroy --remove-dns` runs after its Cloudflare record was revoked,
-inject `CLOUDFLARE_API_TOKEN`; teardown validates it before checking owned routing.
+supply a current zone-scoped credential through `CLOUDFLARE_API_TOKEN`. The uninstaller checks ownership before removing routing and uses the saved Grafana URL when the Trust ingress record is absent.
 
 Local cleanup is separate:
 

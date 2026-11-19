@@ -16,6 +16,8 @@
   "docs/PREREQUISITES.md",
   "docs/images/bare-metal-ssh.png",
   "docs/images/gcp-ssh.png",
+  "docs/images/install-account-menu.png",
+  "docs/images/install-dns-validation.png",
   "docs/images/install-handoff.png",
   "docs/images/install-mail.png",
   "docs/images/install-site.png",

@@ -1,7 +1,7 @@
 # CertLocker customer installer
 
 For Google Cloud, create or sign in to your account at [trust.certlocker.io](https://trust.certlocker.io).
-Open **Install setup**, choose **GCP**, and enter your application SMTP settings.
+Select your display name in the Trust header, then **User Details → Install setup**. Choose **GCP** and enter the DNS, site and SMTP settings. [Illustrated setup guide](docs/PREREQUISITES.md#prepare-the-trust-installation)
 Copy the account ID and four-hour installer token, then run this on your workstation.
 
 ```sh
