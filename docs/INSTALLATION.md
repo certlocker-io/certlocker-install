@@ -1,284 +1,116 @@
 # Install CertLocker
 
-Choose the installation path that matches who owns the machines.
+You’ll use two places during installation. First, sign in to CertLocker Trust in your browser to tell the installer about your site. Then run the installer on your own macOS or Linux workstation. When setup finishes, your users sign in at **your front-office URL**.
 
-| Environment | Command | Resources |
+| What do you have today? | Choose in Trust | Follow this path |
 | --- | --- | --- |
-| Google Cloud | `./uncloudctl up` | Provisions and installs two VMs in your project. |
-| Existing physical servers or cloud VMs | `./uncloudctl bare-metal` | Enrolls two existing servers over SSH and uses your public or private network. |
+| Two Ubuntu servers you can reach over SSH, including physical servers or public or private cloud instances | **GENERIC** | [Install on existing machines](#install-on-existing-machines) |
+| A Google Cloud project where you want CertLocker to create and configure two VMs | **GCP** | [Create servers in Google Cloud](#create-servers-in-google-cloud) |
 
-## 1. Prepare your accounts
+## Prepare your installation in Trust
 
-Sign in to your customer account at [trust.certlocker.io](https://trust.certlocker.io) and complete the [illustrated Install setup](PREREQUISITES.md) for your environment. The installer fetches the administrator email, SMTP configuration and generated master key from the selected Trust group. The hosted Trust installation config also supplies read-only access to the release images.
+1. Sign in to your customer account as a **super user**. Select your display name in the header to open **User Details**, then select **Install setup** at the bottom of the panel. [Open CertLocker Trust](https://trust.certlocker.io)
+
+   <img src="images/install-user-details.png" width="480" alt="Footer of User Details showing the Install setup button">
+
+2. Enter an **install name** you will recognize later, such as `north-site`. Choose **GENERIC** or **GCP** using the table above. For GENERIC, have both servers’ SSH addresses and a key authorized on both machines. For GCP, you can leave the SSH username and key blank and let the installer generate a key.
+3. Enter your Cloudflare zone, service URLs, administrator details and SMTP settings. For a zone such as `example.org`, use distinct names such as `https://app.example.org`, `https://admin.example.org` and `https://grafana.example.org`. Use an administrator mailbox you can read. It receives the sign-in code. Select **Test SMTP** for a public mail server, then **Create**. [Field-by-field guide and screenshots](PREREQUISITES.md#prepare-the-trust-installation)
+4. Keep the final screen open. You’ll enter its **Account ID** and paste its **Token ID** at the workstation’s hidden deployment-token prompt. New setup tokens default to four hours.
+
+   <img src="images/install-handoff.png" width="480" alt="Final Install setup screen with the Account ID and deployment token needed at the workstation">
+
+On your workstation, download the installer and enter its directory:
+
+```sh
+git clone https://github.com/certlocker-io/certlocker-install.git
+cd certlocker-install
+```
+
+If the launcher offers to prepare the controller tools, complete the prompts on this workstation. On macOS, have Docker Desktop running when the packaged controller is used. Use the same checkout and workstation for later updates or recovery. The commands below use `north-site` as an example. **Replace it with your installation name.** Follow only the path you chose in Trust.
 
 ## Install on existing machines
 
-A DNS-safe Install Setup name becomes the default company slug when you run `./uncloudctl bare-metal`. Pass a company argument to set it explicitly. Clone the installer on a workstation that can reach both hosts over SSH (TCP 22). Use public addresses for internet-reachable instances or private addresses reachable from your network or VPN. The optional readiness check prompts for your hosted Trust account ID and installation token. It retrieves both management IPv4 addresses and the SSH username and key from GENERIC Install setup. The private key stays in temporary memory-backed storage during the check.
+Use two dedicated Ubuntu 24.04 amd64 servers. We recommend 8 GiB RAM per server. The SSH user must have passwordless sudo on both. Public IPs work directly from the internet. For private IPs, connect your workstation to a network or VPN that routes to both servers.
+
+Before running the installer, configure the provider security groups and any upstream firewalls:
+
+| Allow this traffic | Source | Destination |
+| --- | --- | --- |
+| TCP **22** for SSH | Your installer workstation | Both servers |
+| TCP **80** for HTTP and **443** for HTTPS | Your workstation for verification, and your clients or load balancer for application traffic | Both servers |
+| UDP **51820** for the encrypted link | Each server | The other server, in both directions |
+
+Enter your client or load-balancer source ranges in **Ingress IPv4 networks** in Install setup. If the application is public, you can put a public load balancer in front and allow its source ranges on both hosts. Point the application DNS names at that entry point. Grafana needs a route from your allowed monitoring addresses. [Detailed network checklist](PREREQUISITES.md#bare-metal-network-checklist)
+
+**Check the servers first.** This checks SSH access, host identity and peer connectivity. The installer discovers the peer addresses for you.
 
 ```sh
 ./uncloudctl bare-metal north-site --preflight-only
 ```
 
-In Trust, choose **GENERIC** and enter the short SSH hostnames in the same order as the two management IPs (for example, `node-a`, then `node-b`). The installer checks each hostname over SSH before changing either server. Enter the Cloudflare zone and the three HTTPS URLs for the front office, backoffice and Grafana. Use distinct names one label below the zone, such as `https://install.example.org`, `https://backoffice-install.example.org` and `https://grafana-cl-install.example.org`. Use public or internal DNS to point the application names at your ingress. Open inbound TCP 80 and 443 to both hosts from the workstation and the client or load-balancer sources. Apply these rules in your cloud security groups and upstream firewalls, and enter the client or load-balancer ranges in Trust. Allow UDP 51820 between the hosts in both directions.
-
-Enter the zone's Cloudflare API token in Trust Install Setup or at the installer's hidden prompt. Trust stores it in the install group and puts its secret ID in the install configuration. The installer validates the credential against Cloudflare. Use the deployment token shown by Install Setup (the configuration's `access_token`) at the installer login prompt.
-
-The following excerpt shows the network fields in the generated `<install-name>_install_config` Trust secret. Each hostname corresponds to the IP at the same position. Trust fills in the Cloudflare secret ID.
-
-```json
-{
-  "server_ips": ["192.0.2.11", "192.0.2.12"],
-  "server_hostnames": ["node-a", "node-b"],
-  "dns_zone": "example.org",
-  "front_url": "https://install.example.org",
-  "backoffice_url": "https://backoffice-install.example.org",
-  "grafana_url": "https://grafana-cl-install.example.org",
-  "cloudflare_secret_id": "example-secret-id"
-}
-```
-
-For older Trust records without saved addresses, pass both management addresses after `north-site` or enter them when prompted. If Trust has saved addresses, any positional addresses must match that pair in order.
-
-The installer selects peer addresses from the hosts' IPv4 routes and verifies UDP connectivity on port 51820 on fresh servers. To override discovery, supply `--peer-1` and `--peer-2` or configure the nodes' `wireguard_endpoint` values. On enrolled servers, use `--verify-only` to check the installed mesh.
-
-Confirm the printed hostnames, VPN sources, RAM and peer addresses. We recommend 8 GiB RAM per host for the full stack. You can bring smaller instances, including 4 GiB hosts. To pin expected hostnames, supply a JSON `--config` with `nodes.north-site-a.expected_hostname` and `nodes.north-site-b.expected_hostname`.
-
-Once both servers pass, install using the same company name and the settings saved in Trust:
+**Install after the check passes.** Supply the same Trust account ID and deployment token when prompted. The installer configures the hosts, database, application, certificates and monitoring.
 
 ```sh
 ./uncloudctl bare-metal north-site
 ```
 
-Enter the account ID and token at the prompts. The installer checks both hosts again before hardening, then uses the pinned release, private mesh, database, application and certificate playbooks. Your network team manages application DNS and load balancing on this path. Keep Grafana reachable from its allowed monitoring sources.
+## Create servers in Google Cloud
 
-Retry using the same company, addresses, configuration and installation state. Add `--continue` to resume completed stages, or `--verify-only` to verify an installed pair. The `up`, `resume` and `destroy` commands below manage Google infrastructure.
-
-### First login
-
-After creating the superuser, the installer displays its email and password in an interactive terminal. A resumed installation that preserves the existing password cannot display it. Keep the terminal private. Automation can inject `CERTLOCKER_INITIAL_ADMIN_PASSWORD` through its secret manager.
-
-Open your configured front-office HTTPS URL and sign in with the administrator email and password. For a newly created administrator, retrieve the verification code from that email account.
-
-### Update an installed pair
-
-From the same installer checkout and controller used for installation:
+Have a billed Google Cloud project with Compute Engine enabled, permission to create VMs and network resources, and one free VPC network slot. The default public routing also requires Cloudflare Load Balancing for your zone. [Google and Cloudflare prerequisites](PREREQUISITES.md)
 
 ```sh
-git pull --ff-only
-./uncloudctl update COMPANY --plan
-./uncloudctl update COMPANY
-```
-
-With one active inventory, `./uncloudctl update` selects it automatically. Before an update, open Tokens in your account at trust.certlocker.io. Check the expiry of the group deployment token and its Install setup configuration token. Select Renew on expired tokens. At the installer prompt enter the reusable group deployment token (the `access_token` in Install setup). The token restricted to the configuration secret can only read that secret. The command checks the bundled `releases/current.json` against its checksum, stages the pinned images, verifies the peer and drains one node at a time. HAProxy and both nodes must be healthy before rollout. After an interrupted rollout, correct the reported failure and retry with the same checkout. The controller records the new release after the final HA checks. If requests remain active when the drain times out, the rollout stops. On installations with a single API owner, handing ownership to the peer stops the old API before its replacement becomes ready. Interactive requests can fail during that interval even with a healthy external load balancer.
-
-### Uninstall from existing servers
-
-```sh
-./uncloudctl bare-metal uninstall COMPANY
-```
-
-Supply a token for the installed group's provisioning key, or use `--ssh-key PATH` or `--workstation-ssh` for an existing authorized login. The uninstaller verifies both SSH host keys, machine IDs and enrollment names, then asks you to type the company name. `--yes` confirms unattended deletion. It destroys the application, monitoring and PostgreSQL data, removes the mesh and startup units, verifies both machines, revokes the company deployment credentials in the issuing Trust and archives the local installation records. With workstation SSH or a supplied SSH key, host teardown can proceed while the group token is inactive. A current group token is required to finish Trust cleanup. If cleanup stops there, rerun the same uninstall command with an active group token before reinstalling. The uninstaller resumes after host verification. The original Install setup inputs and historical completion reports are retained.
-
-## 2. Start Google Cloud setup
-
-```sh
-git clone https://github.com/certlocker-io/certlocker-install.git
-cd certlocker-install
 ./uncloudctl up
 ```
 
-Use macOS or Linux. The launcher prepares missing Python on supported systems
-and selects a packaged Linux controller when the native toolchain is incomplete.
-On macOS, complete any Homebrew, Docker Desktop, administrator and first-run
-prompts. Debian/Ubuntu can install Docker through the bootstrap; other Linux
-distributions need a Docker-compatible engine prepared by your administrator.
-Google browser login stays on your workstation. Select the Google project where the VMs will run. Google setup needs one available project-wide VPC network slot for a fresh pair. If the project has reached its network quota, free a slot or increase the limit before retrying.
+1. Enter the Account ID and Token ID from Trust. Use your install name when asked for a company or environment name.
+2. Sign in to Google in the browser and select the project that should own and pay for the VMs. Choose two different zones. The default VM size is `e2-standard-2` (2 vCPUs, 8 GiB RAM), with a 100 GiB boot disk per VM.
+3. Confirm any site settings still needed. For a production site choose **Production**. Supply the public egress IPs from which you need monitoring access. The installer also allows the CertLocker update and monitoring sources `88.81.117.228/32` and `185.88.0.182/32`.
+4. Leave the installer running through verification. It creates the infrastructure, installs the application on both VMs, obtains the TLS certificate and configures Cloudflare routing. It saves your Google settings in `uncloud/environments/north-site.json` for the next run.
 
-When running GCP alongside bare metal, use a separate company slug and distinct service hostnames. Trust supplies the site settings from **User Details → Install setup → GCP**.
+## Sign in and check your site
 
-To prepare the toolchain before installation, optionally run:
+Wait for the installer to report that setup passed. Open the **front-office URL you entered in Trust**, sign in with the initial administrator email and password, then enter the verification code sent to that mailbox. If you left the password blank in Trust, use the password you set at the installer's hidden prompt.
 
-```sh
-./prepare-controller
-```
+Open your **backoffice URL** to check administrative access. Open your **Grafana URL** from an allowed monitoring address. If the installer passed but the public site is unreachable, check where the hostname resolves and whether TCP 443 reaches the load balancer and both origins.
 
-The controller includes checksum-pinned Terraform, Google CLI and mesh CLI,
-plus Ansible and pinned collections. Its image build contains no credentials.
-At runtime it mounts this checkout and your SSH directory, uses memory-backed
-temporary storage, and disables container swap.
+## If setup stops
 
-## 3. Answer the wizard
+Keep the checkout, generated inventory and controller state. Correct the reported problem, then use the same install name and Trust account.
 
-Setup asks for:
+| What stopped? | What to do |
+| --- | --- |
+| Trust rejects an expired token | In your hosted Trust account, open **Tokens**. Check the installation’s group deployment token and its configuration token. Renew expired tokens. At the installer prompt, enter the group deployment token shown by Install setup. |
+| Existing-server setup | Run `./uncloudctl bare-metal north-site --continue`. To check an already installed pair, use `--verify-only`. |
+| Google Cloud setup | Run `./uncloudctl check --config uncloud/environments/north-site.json` and follow its recovery command. For a partially provisioned pair, this is usually `resume --config uncloud/environments/north-site.json`. If provisioning never started, retry `up --config` with the same file. |
+| Google reports a VPC quota error | Free one network slot in the selected project or increase its quota, then follow the recovery command. |
+| Certificate or SMTP checks fail | Check the Cloudflare token’s permissions for the chosen zone, or the SMTP hostname, port, TLS mode and credentials. For a private mail relay, ensure your installer workstation can reach it. |
 
-- Your Trust account ID, hidden Install setup token and a new company/environment slug.
-- Google sign-in and a project selected from your accessible active projects.
-- Two distinct Google zones and a VM type for each server. The default is
-  `e2-standard-2`, with at least 2 vCPUs and 8 GiB RAM per server.
-- Boot disk size, defaulting to 100 GiB per server.
-- Your Cloudflare DNS zone, deployment type, front-office and backoffice URLs, administrator details
-  and ACME contact email. Choose `prod` for a production installation.
-- Any additional customer VPN or whitelist IPv4 addresses, separated by commas.
-  Individual addresses and `/32` CIDRs are accepted; an empty answer is allowed.
+### What to keep for recovery
 
-`88.81.117.228/32` and `185.88.0.182/32` are included automatically as
-**certlocker updater** addresses for CertLocker monitoring and update access.
-Both are added to the Google and host SSH firewall allowlists and the monitoring
-allowlist, and exempted from Fail2ban.
-The wizard asks only for additional customer monitoring addresses.
+Back up the installer checkout’s generated inventory (`inventory/uncloud/north-site/`) and the private controller state. Google installations also use the saved `uncloud/environments/north-site.json` profile and a dedicated provisioning key. Keep these files in access-controlled storage.
 
-The wizard writes `uncloud/environments/COMPANY.json` with mode 0600. It contains
-installation settings and key paths, not tokens, passwords or private key
-contents. Keep your controller state private and backed up. Google provisioning
-generates a dedicated Ed25519 key in the private company state directory.
-Retries reuse it. After host enrollment the installer also saves the verified
-identity in your hosted Trust group and the installed Trust for maintenance and
-browser Terminal access. Verified teardown removes the controller key.
+For unattended Google installs, provide a **completed** company profile and inject the deployment token as `CERTLOCKER_TOKEN` or `TRUST_TOKEN` through your secret manager. Supply the Trust account ID with `--account-id` if it is absent from the profile. Run `./uncloudctl up --non-interactive --config uncloud/environments/north-site.json`. The deployment token is distinct from the initial administrator password.
 
-For existing Ubuntu servers, including public or private VMs in AWS or Azure, follow the
-[bare-metal installation steps](#install-on-existing-machines).
+## Update an installed pair
 
-## 4. Provisioning and installation
-
-Before provisioning, setup checks Trust authorization, Google access, Cloudflare
-routing and DNS ownership, the production ACME profile, application SMTP and the
-immutable release pin. SMTP authentication sends no email. Cloudflare access is enrolled on your workstation. SMTP credentials come from your Trust install configuration.
-
-Terraform creates the two Ubuntu 24.04 servers, their private network, persistent
-boot disks, static public addresses and bounded firewall rules. SSH is restricted
-to the installation administrator and CertLocker updater. HTTPS is public;
-WireGuard is restricted to the peer private addresses. Database and monitoring
-service ports stay private. Before setup probes either host, the installer waits
-up to ten minutes per server for the dedicated SSH key and passwordless sudo to
-work. Installer SSH connections disable agent identities so unrelated keys cannot
-exhaust authentication attempts. Failures identify authentication, reachability,
-host-key or sudo problems; host-key mismatches stop immediately.
-
-The installer uses Terraform's verified server outputs to configure the hosts,
-private mesh, database, application, certificate automation and monitoring. It
-retrieves the GHCR credential through Trust, authenticates Docker using temporary
-memory-backed configuration and pulls all eight application images at the pinned
-digests. Downloads run as a remote job with a 30-minute limit and polling, so a
-long image pull does not depend on one continuous SSH session. Temporary registry
-authentication is removed even if a pull fails.
-
-The [release manifest](../releases/current.json) lists the application release and image digests. The installer verifies its checksum. A verified snapshot is saved
-for the installation before servers are provisioned. Resume preserves that pin;
-it does not silently advance to another release. A separately supplied manifest
-can be selected with the non-secret `release_manifest` path in a saved company
-profile before starting a new installation.
-
-The supplied administrator details create the company superuser. Enter its
-password at the hidden prompt. Setup marks the administrator email as verified. At sign-in, a new administrator
-receives a verification code through the configured SMTP server. Setting a bootstrap
-password for an existing administrator preserves an enrolled second factor and
-enables email codes if the account has none. The dedicated provisioning SSH key is retained both at
-**trust.certlocker.io** for updates and maintenance and in your **freshly
-installed company Trust** for browser Terminal and host access. Certificate renewal
-uses separate restricted host automation access.
-
-Setup runs installation verification and publishes healthy Cloudflare routing.
-Normal `up` does not run disruptive failover drills. Open your front office and
-backoffice and verify sign-in, HTTPS and mail. Access Grafana and its
-`/prometheus/` path from an allowed VPN address. Grafana DNS is unproxied so the
-origin can check the real client address.
-
-## 5. Check or resume
-
-Each interactive `up` creates a new named installation. If setup stopped, keep
-the checkout, generated profile and private controller state. Resume uses the original
-Google provisioning key and requires a valid token for the saved account and group.
+From the original checkout, pull the current installer and preview the release. The preview uses the bundled [release manifest](../releases/current.json). Check that the proposed release and company are the ones you intend to update.
 
 ```sh
-./uncloudctl check
-./uncloudctl resume
+git pull --ff-only
+./uncloudctl update north-site --plan
 ```
 
-When several companies are present, select the generated profile explicitly:
+When ready, run `./uncloudctl update north-site`. Both nodes and HAProxy must be healthy. The updater drains and updates one node at a time. A deployment with a single active API owner can briefly interrupt requests during handover. If the update stops, resolve the reported health or drain issue and rerun it from the same checkout.
 
-```sh
-./uncloudctl check --config uncloud/environments/COMPANY.json
-./uncloudctl resume --config uncloud/environments/COMPANY.json
-```
+## Remove an installation
 
-`check` reports infrastructure, inventory, installation markers and the next
-command. Resume reuses the same pair, completing interrupted provisioning with
-a create-only plan when safe and continuing from the first incomplete setup
-stage. It refuses a replacement SSH key or another installation's state.
-Saved mesh connections are rebound to the current run's temporary key file before
-connecting, so expired temporary paths from an earlier run do not prevent resume.
-If failure occurred before VMs were created, `check` can direct you to retry
-`up --config uncloud/environments/COMPANY.json` instead.
+**Back up any application or PostgreSQL data you need before removal.** Use the command for the installation you intend to remove.
 
-Run external dependency checks without provisioning VMs using:
+| Installation | Removal command | What it removes |
+| --- | --- | --- |
+| Existing servers | `./uncloudctl bare-metal uninstall north-site` | Removes the installed stack, database, monitoring, and mesh from both machines. The machines remain yours. |
+| Google Cloud | `./uncloudctl destroy --config uncloud/environments/north-site.json --remove-dns --remove-trust` | Removes the deployment’s DNS routing, VMs, boot disks, reserved addresses, network resources and deployment credentials. |
 
-```sh
-./uncloudctl resume --config uncloud/environments/COMPANY.json --preflight-only
-```
+The existing-server uninstaller checks both machines before asking you to type the company name. If the deployment token has expired, an authorized workstation SSH login (`--workstation-ssh`) or key (`--ssh-key PATH`) can remove the stack. Renew the group token and rerun the uninstall command to finish Trust cleanup before reinstalling.
 
-For unattended setup, use a completed company profile and secret-manager-injected
-credentials:
-
-```sh
-./uncloudctl up --non-interactive --config uncloud/environments/COMPANY.json
-```
-
-This optional mode does not change the normal wizard-based workflow.
-
-## 6. Remove an installation
-
-To remove a selected installation, including its owned DNS and Trust records:
-
-```sh
-./uncloudctl destroy --config uncloud/environments/COMPANY.json --remove-dns --remove-trust
-```
-
-Teardown checks company ownership, withdraws routing before releasing origin IPs
-and revokes company secrets after infrastructure removal. It does not revoke the
-shared registry credential itself. Removal destroys the selected servers and
-their boot disks; preserve required data and backups first.
-
-After verified teardown, the active inventory is archived under that run's
-`retired-inventory/` directory. The saved company profile can then be used with
-`up --config` to install a fresh pair. Keep the original Install setup records and provide the initial administrator
-password again when running unattended after revoking deployment records.
-If a repeated `destroy --remove-dns` runs after its Cloudflare record was revoked,
-supply a current zone-scoped credential through `CLOUDFLARE_API_TOKEN`. The uninstaller checks ownership before removing routing and uses the saved Grafana URL when the Trust ingress record is absent.
-
-Local cleanup is separate:
-
-```sh
-./uncloudctl clean --config uncloud/environments/COMPANY.json
-```
-
-`clean` removes the generated local profile, state, inventory and dedicated SSH
-key. It does not destroy Google resources. Follow `check` and complete cloud
-teardown before cleaning local ownership records.
-
-## Operation and troubleshooting
-
-Docker logs rotate at 20 MiB across five files. Loki retains seven days;
-Prometheus retains up to 30 days capped at 4 GiB. Weekly cleanup preserves
-volumes and pinned images. Monitor free disk and certificate automation health.
-Keep host certificate automation tokens active so renewals can continue.
-
-For Google errors, check billing, Compute Engine API availability, account
-permissions and quota. For GHCR errors, check that the Trust token can read the
-registry record and that its credential can pull the pinned images. For
-Cloudflare errors, check token scope, Load Balancing entitlement and DNS ownership.
-Reuse the enrolled DNS settings on retry rather than resetting Trust records.
-
-Generated inventory is under `inventory/uncloud/COMPANY/`. Native controller
-state is under `~/.local/share/certlocker/cl-deployment/COMPANY/`; the packaged
-controller home is under `~/.local/share/certlocker/controller-home/`. Use the
-same native or packaged mode for resume. Share redacted diagnostics through your
-private support channel. Coordinate live failure and restore acceptance testing
-with CertLocker before production handover.
-
-### Frontend request allowance
-
-Customer UI, Back Office and REST requests share a limit of 400 requests per client
-IP per 10 seconds at each HAProxy origin. Set `"http_rate_limit": 400` in the company
-JSON to change it (integer 1–999999); setup and redeploy render this into ingress.
-Cloudflare requests use the verified CDN peer's `CF-Connecting-IP`; direct clients
-use their connection IP and cannot spoof that header. Readiness checks are exempt.
+For Google Cloud, keep the saved profile if you intend to reinstall using the same settings. After a verified destroy, `./uncloudctl clean --config uncloud/environments/north-site.json` also removes the local profile and controller state.

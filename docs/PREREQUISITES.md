@@ -19,7 +19,7 @@ Sign in as a **super user**. Select your display name in the header to open **Us
 
 <details><summary>Find Install setup in User Details</summary>
 
-<img src="images/install-user-details.png" width="480" alt="User Details with the Install setup button in the footer">
+<img src="images/install-user-details.png" width="480" alt="User Details footer with the Install setup button">
 
 </details>
 
@@ -65,13 +65,13 @@ Sign in as a **super user**. Select your display name in the header to open **Us
 
    </details>
 
-5. **Copy the account ID and four-hour token.** Enter the account ID on your workstation and paste the token at the hidden prompt. For unattended runs, supply `--account-id` or `CERTLOCKER_ACCOUNT_ID` and inject `TRUST_TOKEN` or `CERTLOCKER_TOKEN` through your secret manager. Keep the token out of shell arguments and company JSON. On retry after expiration, use a fresh HTTPS SECRET token for the same account and install group.
+5. **Copy the account ID and four-hour token.** Enter the account ID on your workstation and paste the token at the hidden prompt. For unattended runs, supply `--account-id` or `CERTLOCKER_ACCOUNT_ID` and inject `TRUST_TOKEN` or `CERTLOCKER_TOKEN` through your secret manager. Keep the token out of shell arguments and company JSON. If the token expires, open **Tokens** in your Trust account and renew the group deployment token before retrying.
 
    <img src="images/install-handoff.png" width="480" alt="Mock completion screen showing separate Account ID and Token ID fields">
 
 ### Registry and certificate credentials
 
-For new installations, the grouped Trust configuration contains `image_pull_access`, a Base64-encoded registry login with the `read:packages` scope. Treat it as a credential. The installer decodes it in memory when preparing release image access. Older configurations can use their existing GHCR record or the legacy `--ghcr-token-file` option.
+Trust supplies access to the CertLocker release images when you create Install setup. Your servers need outbound access to the image registry. You can run the installer without a personal GitHub account or registry token.
 
 Use a Cloudflare **user API token** scoped to your zone. Enter it in Trust Install setup or at the installer’s hidden prompt. The installer reuses a valid credential in Trust and validates a replacement before saving it. For unattended recovery, supply the replacement through `CLOUDFLARE_API_TOKEN`. Network failures and rate limits leave the saved credential intact.
 
