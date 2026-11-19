@@ -57,7 +57,7 @@ Sign in as a **super user**. Select your display name in the header to open **Us
 
    Select **Test SMTP** before creating the setup. Hosted Trust checks public IPv4 mail servers on ports 25, 465, 587 and 2525. It validates the TLS certificate when TLS is enabled and authenticates when **Auth** is selected. The check sends no email. For private relays or other ports, create the setup and let the installer check SMTP from your network.
 
-   **SMTP certificate trust** controls which server certificates the mail sender accepts during TLS. The wildcard `*` accepts any certificate, including a self-signed one. The 1.1.30 mail sender always uses `*`, even when the installation configuration contains a hostname. The installer’s SMTP connectivity check separately verifies the certificate using the controller’s trusted certificate authorities.
+   **SMTP certificate trust** controls which server certificates the mail sender accepts during TLS. The wildcard `*` accepts any certificate, including a self-signed one. The bundled mail sender currently uses `*`, even when the installation configuration contains a hostname. The installer’s SMTP connectivity check separately verifies the certificate using the controller’s trusted certificate authorities.
 
    <details><summary>SMTP example</summary>
 

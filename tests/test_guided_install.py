@@ -292,7 +292,7 @@ class GuidedInstallTests(unittest.TestCase):
             module.validate_plan({'resource_changes': [{'address': 'foreign.resource',
                 'change': {'actions': ['delete']}}]}, 'example-project', False)
         manifest, _ = bundled_release_manifest(ROOT / 'releases/current.json')
-        self.assertEqual(manifest['release'], 'prod_1.1.30')
+        self.assertEqual(manifest['release'], 'prod_1.1.31')
 
     def test_preflight_pins_bundled_release_and_resume_preserves_it(self):
         config = company_config()
@@ -313,7 +313,7 @@ class GuidedInstallTests(unittest.TestCase):
             first = dependencies.check_dependencies('example', trust, config, state)
             with patch.object(dependencies, 'bundled_release_manifest', side_effect=AssertionError('Resume must use saved pin')):
                 second = dependencies.check_dependencies('example', trust, config, state)
-            self.assertEqual(first['release'], 'prod_1.1.30')
+            self.assertEqual(first['release'], 'prod_1.1.31')
             self.assertEqual(second['release'], first['release'])
             manifest = Path(first['manifest_file'])
             self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)

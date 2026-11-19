@@ -59,10 +59,12 @@ def check_controller(require_google=False, require_no_swap=False, require_terraf
             collections = json.loads(result.stdout) if result.returncode == 0 else {}
         except ValueError:
             collections = {}
-        for name, version in (('ansible.posix', '1.5.4'), ('community.general', '8.3.0')):
-            actual = next((items[name].get('version') for items in collections.values() if name in items), None)
-            if actual != version:
-                problems.append('Ansible collection ' + name + ':' + version)
+        names = ('ansible.posix', 'community.general')
+        versions = tuple(next((items[name].get('version') for items in collections.values() if name in items), None)
+                         for name in names)
+        if versions not in {('2.2.2', '14.0.1'), ('1.5.4', '8.3.0')}:
+            problems.append('Ansible collections ansible.posix/community.general must match the packaged controller '
+                            'or the native requirements in collections/requirements.yml')
     if problems:
         raise ValueError('Controller prerequisites missing or incompatible: ' + '; '.join(problems))
     print(

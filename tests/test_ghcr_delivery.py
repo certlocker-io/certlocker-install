@@ -19,10 +19,10 @@ from uncloud_support import (
 class GhcrDeliveryTests(unittest.TestCase):
     def test_bundled_production_release_is_ready_for_ghcr(self):
         manifest, _ = bundled_release_manifest(ROOT / 'releases/current.json')
-        self.assertEqual(manifest['release'], 'prod_1.1.30')
+        self.assertEqual(manifest['release'], 'prod_1.1.31')
         self.assertEqual(len(manifest['services']), 8)
         self.assertEqual({item['version'] for item in manifest['services'].values()},
-                         {'prod_1.1.30'})
+                         {'prod_1.1.31'})
         self.assertTrue(all(item['image'].startswith('ghcr.io/certlocker-io/')
                             for item in manifest['services'].values()))
 

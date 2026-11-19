@@ -52,6 +52,17 @@
       ansible.builtin.fail:
         msg: Both origins could not drain safely; original healthy backends restored.
 
+- name: Refresh routing configuration for the selected web interfaces on this drained node
+  ansible.builtin.copy:
+    src: "../certlocker-stack/{{ item.source }}/nginx.conf"
+    dest: "/opt/certlocker/{{ uncloud_company }}/uncloud-apps/{{ item.service }}.nginx.conf"
+    mode: '0600'
+  delegate_to: "{{ release_node }}"
+  loop:
+    - {source: cl, service: ui}
+    - {source: bo, service: backoffice-ui}
+  when: item.service in uncloud_selected_services
+
 - name: Apply explicitly requested SMTP settings before recreating DataService
   ansible.builtin.include_tasks: uncloud_apps_smtp_node.yml
   when: uncloud_refresh_smtp | default(false) | bool
