@@ -160,7 +160,7 @@ def load_setup(trust, config, provider):
         if 'ingress_cidrs' in options:
             networks = [ipaddress.IPv4Network(cidr, strict=False) for cidr in options['ingress_cidrs']]
             if any(network.prefixlen == 0 for network in networks):
-                raise ValueError('Private ingress requires scoped source networks')
+                raise ValueError('HTTP and HTTPS ingress requires scoped source networks')
             config['ingress_cidrs'] = [str(network) for network in networks]
     config.update(trust_account_id=trust.routes.account_id, trust_group=trust.group,
                   install_config_id=identifier, initial_admin_email=admin)

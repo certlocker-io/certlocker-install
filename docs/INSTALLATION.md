@@ -5,29 +5,21 @@ Choose the installation path that matches who owns the machines.
 | Environment | Command | Resources |
 | --- | --- | --- |
 | Google Cloud | `./uncloudctl up` | Provisions and installs two VMs in your project. |
-| Bare metal or existing private VMs | `./uncloudctl bare-metal` | Enrolls two existing servers over SSH and uses your internal routing. |
+| Existing physical servers or cloud VMs | `./uncloudctl bare-metal` | Enrolls two existing servers over SSH and uses your public or private network. |
 
 ## 1. Prepare your accounts
 
-Complete the [prerequisites and illustrated Trust setup](PREREQUISITES.md) for your environment. The installer fetches the administrator email, SMTP configuration and generated master key from the selected Trust group. The hosted Trust installation config also supplies read-only access to the release images.
+Sign in to your customer account at [trust.certlocker.io](https://trust.certlocker.io) and complete the [illustrated Install setup](PREREQUISITES.md) for your environment. The installer fetches the administrator email, SMTP configuration and generated master key from the selected Trust group. The hosted Trust installation config also supplies read-only access to the release images.
 
 ## Install on existing machines
 
-A DNS-safe Install Setup name becomes the default company slug when you run `./uncloudctl bare-metal`. Pass a company argument to set it explicitly. Clone the installer and connect your workstation to the customer network or VPN. The optional readiness check prompts for your hosted Trust account ID and installation token. It retrieves both management IPv4 addresses and the SSH username and key from GENERIC Install setup. The private key stays in temporary memory-backed storage during the check.
+A DNS-safe Install Setup name becomes the default company slug when you run `./uncloudctl bare-metal`. Pass a company argument to set it explicitly. Clone the installer on a workstation that can reach both hosts over SSH (TCP 22). Use public addresses for internet-reachable instances or private addresses reachable from your network or VPN. The optional readiness check prompts for your hosted Trust account ID and installation token. It retrieves both management IPv4 addresses and the SSH username and key from GENERIC Install setup. The private key stays in temporary memory-backed storage during the check.
 
 ```sh
 ./uncloudctl bare-metal north-site --preflight-only
 ```
 
-If you created Install setup in a locally running Trust instance, point the installer at that Gateway:
-
-```sh
-./uncloudctl bare-metal install --trust-url=http://localhost:8080/gateway/rest/api
-```
-
-Use the same URL on retries and verification runs. The default is the hosted Trust Gateway. Remote gateways require HTTPS. A packaged controller using localhost requires Docker host networking (enable host networking in Docker Desktop).
-
-In Trust, choose **GENERIC** and enter the short SSH hostnames in the same order as the two management IPs (for example, `dev02`, then `dev03`). The installer checks each hostname over SSH before changing either server. Enter the Cloudflare zone and the three HTTPS URLs for the front office, backoffice and Grafana. Use distinct names one label below the zone, such as `https://install.example.org`, `https://backoffice-install.example.org` and `https://grafana-cl-install.example.org`. Your internal DNS must resolve them to the private ingress.
+In Trust, choose **GENERIC** and enter the short SSH hostnames in the same order as the two management IPs (for example, `node-a`, then `node-b`). The installer checks each hostname over SSH before changing either server. Enter the Cloudflare zone and the three HTTPS URLs for the front office, backoffice and Grafana. Use distinct names one label below the zone, such as `https://install.example.org`, `https://backoffice-install.example.org` and `https://grafana-cl-install.example.org`. Use public or internal DNS to point the application names at your ingress. Open inbound TCP 80 and 443 to both hosts from the workstation and the client or load-balancer sources. Apply these rules in your cloud security groups and upstream firewalls, and enter the client or load-balancer ranges in Trust. Allow UDP 51820 between the hosts in both directions.
 
 Enter the zone's Cloudflare API token in Trust Install Setup or at the installer's hidden prompt. Trust stores it in the install group and puts its secret ID in the install configuration. The installer validates the credential against Cloudflare. Use the deployment token shown by Install Setup (the configuration's `access_token`) at the installer login prompt.
 
@@ -51,27 +43,21 @@ The installer selects peer addresses from the hosts' IPv4 routes and verifies UD
 
 Confirm the printed hostnames, VPN sources, RAM and peer addresses. We recommend 8 GiB RAM per host for the full stack. You can bring smaller instances, including 4 GiB hosts. To pin expected hostnames, supply a JSON `--config` with `nodes.north-site-a.expected_hostname` and `nodes.north-site-b.expected_hostname`.
 
-Once both servers pass, run the install using the SSH identity you enrolled in Trust. This example allows Grafana access from one VPN egress address and web traffic from a private load balancer.
+Once both servers pass, install using the same company name and the settings saved in Trust:
 
 ```sh
-./uncloudctl bare-metal north-site \
-  --deployment dev --dns-zone example.com --acme-email admin@example.com \
-  --vpn-ip 192.0.2.30 --ingress-cidr 192.0.2.40/32
+./uncloudctl bare-metal north-site
 ```
 
-Enter the account ID and token at the prompts. The installer checks both hosts again before hardening, then uses the pinned release, private mesh, database, application and certificate playbooks. Configure the application and Grafana names in your internal DNS. This path leaves public application DNS and load-balancer provisioning to your network team.
+Enter the account ID and token at the prompts. The installer checks both hosts again before hardening, then uses the pinned release, private mesh, database, application and certificate playbooks. Your network team manages application DNS and load balancing on this path. Keep Grafana reachable from its allowed monitoring sources.
 
 Retry using the same company, addresses, configuration and installation state. Add `--continue` to resume completed stages, or `--verify-only` to verify an installed pair. The `up`, `resume` and `destroy` commands below manage Google infrastructure.
 
-### First login and Trust chat
+### First login
 
 After creating the superuser, the installer displays its email and password in an interactive terminal. A resumed installation that preserves the existing password cannot display it. Keep the terminal private. Automation can inject `CERTLOCKER_INITIAL_ADMIN_PASSWORD` through its secret manager.
 
-For a verified install notification in the operator Trust Google Chat space, set `CERTLOCKER_INSTALL_CHAT_WEBHOOK_FILE` to an owner-only file on the controller containing that space's incoming webhook URL. Alternatively configure the operator Trust webhook secret. The message includes release, hostnames, addresses and URLs. If delivery is pending, retry it with `python3 scripts/uncloud_install_notification.py /path/to/installation-state`. A confirmed delivery writes a receipt in that directory.
-
-Successful bare-metal and Google installs write a completion report to the Trust that issued the setup. In that Trust, open Back Office, Accounts, select the account, then open Stats to see the reported installation count and the latest report time. Local tests using `--trust-url` report to the selected local Trust. These historical reports survive uninstall.
-
-Google uses the same Install setup site, mail and administrator settings, release manifest and rolling updater. Choose GCP in Trust and run `./uncloudctl up`. Google creates the VM pair in the selected project and zones, assigns its private addresses and configures Cloudflare load balancing. Optional server hostnames in Trust become VM names.
+Open your configured front-office HTTPS URL and sign in with the administrator email and password. For a newly created administrator, retrieve the verification code from that email account.
 
 ### Update an installed pair
 
@@ -83,7 +69,7 @@ git pull --ff-only
 ./uncloudctl update COMPANY
 ```
 
-With one active inventory, `./uncloudctl update` selects it automatically. Before an update, open Tokens in the Trust instance that issued Install setup. Check the expiry of the group deployment token and its Install setup configuration token. Select Renew on expired tokens. At the installer prompt enter the reusable group deployment token (the `access_token` in Install setup). The token restricted to the configuration secret can only read that secret. Use the same `--trust-url` for local Trust. The command checks the bundled `releases/current.json` against its checksum, stages the pinned images, verifies the peer and drains one node at a time. HAProxy and both nodes must be healthy before rollout. After an interrupted rollout, correct the reported failure and retry with the same checkout. The controller records the new release after the final HA checks. If requests remain active when the drain times out, the rollout stops. On installations with a single API owner, handing ownership to the peer stops the old API before its replacement becomes ready. Interactive requests can fail during that interval even with a healthy external load balancer.
+With one active inventory, `./uncloudctl update` selects it automatically. Before an update, open Tokens in your account at trust.certlocker.io. Check the expiry of the group deployment token and its Install setup configuration token. Select Renew on expired tokens. At the installer prompt enter the reusable group deployment token (the `access_token` in Install setup). The token restricted to the configuration secret can only read that secret. The command checks the bundled `releases/current.json` against its checksum, stages the pinned images, verifies the peer and drains one node at a time. HAProxy and both nodes must be healthy before rollout. After an interrupted rollout, correct the reported failure and retry with the same checkout. The controller records the new release after the final HA checks. If requests remain active when the drain times out, the rollout stops. On installations with a single API owner, handing ownership to the peer stops the old API before its replacement becomes ready. Interactive requests can fail during that interval even with a healthy external load balancer.
 
 ### Uninstall from existing servers
 
@@ -91,7 +77,7 @@ With one active inventory, `./uncloudctl update` selects it automatically. Befor
 ./uncloudctl bare-metal uninstall COMPANY
 ```
 
-Supply a token for the installed group's provisioning key, or use `--ssh-key PATH` or `--workstation-ssh` for an existing authorized login. Use `--trust-url` if the provisioning key is in local Trust. The uninstaller verifies both SSH host keys, machine IDs and enrollment names, then asks you to type the company name. `--yes` confirms unattended deletion. It destroys the application, monitoring and PostgreSQL data, removes the mesh and startup units, verifies both machines, revokes the company deployment credentials in the issuing Trust and archives the local installation records. With workstation SSH or a supplied SSH key, host teardown can proceed while the group token is inactive. A current group token is required to finish Trust cleanup. If cleanup stops there, rerun the same uninstall command with an active group token before reinstalling. The uninstaller resumes after host verification. The original Install setup inputs and historical completion reports are retained.
+Supply a token for the installed group's provisioning key, or use `--ssh-key PATH` or `--workstation-ssh` for an existing authorized login. The uninstaller verifies both SSH host keys, machine IDs and enrollment names, then asks you to type the company name. `--yes` confirms unattended deletion. It destroys the application, monitoring and PostgreSQL data, removes the mesh and startup units, verifies both machines, revokes the company deployment credentials in the issuing Trust and archives the local installation records. With workstation SSH or a supplied SSH key, host teardown can proceed while the group token is inactive. A current group token is required to finish Trust cleanup. If cleanup stops there, rerun the same uninstall command with an active group token before reinstalling. The uninstaller resumes after host verification. The original Install setup inputs and historical completion reports are retained.
 
 ## 2. Start Google Cloud setup
 
@@ -108,7 +94,7 @@ prompts. Debian/Ubuntu can install Docker through the bootstrap; other Linux
 distributions need a Docker-compatible engine prepared by your administrator.
 Google browser login stays on your workstation. Select the Google project where the VMs will run. Google setup needs one available project-wide VPC network slot for a fresh pair. If the project has reached its network quota, free a slot or increase the limit before retrying.
 
-When running GCP alongside bare metal, use a separate company slug and distinct service hostnames. Trust supplies the site settings from **User Details → Install setup → GCP**. For setup issued by a local Trust, run `./uncloudctl up --trust-url=http://localhost:8080/gateway/rest/api` and use the same Trust URL for later maintenance.
+When running GCP alongside bare metal, use a separate company slug and distinct service hostnames. Trust supplies the site settings from **User Details → Install setup → GCP**.
 
 To prepare the toolchain before installation, optionally run:
 
@@ -149,7 +135,7 @@ Retries reuse it. After host enrollment the installer also saves the verified
 identity in your hosted Trust group and the installed Trust for maintenance and
 browser Terminal access. Verified teardown removes the controller key.
 
-For existing Ubuntu servers, including private VMs in AWS or Azure, follow the
+For existing Ubuntu servers, including public or private VMs in AWS or Azure, follow the
 [bare-metal installation steps](#install-on-existing-machines).
 
 ## 4. Provisioning and installation
@@ -176,8 +162,7 @@ digests. Downloads run as a remote job with a 30-minute limit and polling, so a
 long image pull does not depend on one continuous SSH session. Temporary registry
 authentication is removed even if a pull fails.
 
-The repository includes the approved `v1.1.30` manifest at
-`releases/current.json` and its matching checksum. A verified snapshot is saved
+The [release manifest](../releases/current.json) lists the application release and image digests. The installer verifies its checksum. A verified snapshot is saved
 for the installation before servers are provisioned. Resume preserves that pin;
 it does not silently advance to another release. A separately supplied manifest
 can be selected with the non-secret `release_manifest` path in a saved company

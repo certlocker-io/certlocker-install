@@ -1,63 +1,55 @@
-# CertLocker customer installer
+# Install CertLocker
 
-For Google Cloud, create or sign in to your account at [trust.certlocker.io](https://trust.certlocker.io).
-Select your display name in the Trust header, then **User Details → Install setup**. Choose **GCP** and enter the DNS, site and SMTP settings. [Illustrated setup guide](docs/PREREQUISITES.md#prepare-the-trust-installation)
-Copy the account ID and four-hour installer token, then run this on your workstation.
+Deploy CertLocker on two Ubuntu servers. Choose **GENERIC** in Trust if you already have both servers, including cloud instances reachable over the internet. Choose **GCP** if you want the installer to create two Google Cloud VMs in your project.
+
+## Start in Trust
+
+1. Sign in as a super user. Select your display name in the header, then **User Details → Install setup**. [Open Trust](https://trust.certlocker.io)
+2. Name the installation and select **GENERIC** or **GCP**. Enter the DNS zone, service URLs, administrator details and SMTP settings. For GENERIC, enter both servers’ SSH IPv4 addresses and an identity authorized on both. For GCP, leave the SSH fields blank to generate a provisioning key.
+3. Copy the **account ID** and **deployment token** from the final screen. The installer prompts for both and retrieves the configuration and release-image credentials from Trust. New Install setup tokens default to four hours. [Prerequisites and wizard screenshots](docs/PREREQUISITES.md)
+
+On the workstation that will run the install, clone the repository:
+
+```sh
+git clone https://github.com/certlocker-io/certlocker-install.git
+cd certlocker-install
+```
+
+## Install on two existing servers
+
+Use two dedicated Ubuntu 24.04 amd64 hosts with public or private IPv4 addresses. We recommend 8 GiB RAM per host. Before running the installer, allow these connections in your cloud security groups and any upstream firewall:
+
+| Source | Destination | Allow |
+| --- | --- | --- |
+| Installer workstation | Both servers | TCP **22** for SSH and TCP **80** and **443** for web checks |
+| Application clients or your load balancer | Both servers | TCP **80** (HTTP) and **443** (HTTPS) |
+| Each server | The other server | UDP **51820** in both directions for the private mesh |
+
+Enter the client or load-balancer source ranges in **Ingress IPv4 networks** in Trust so the host firewall allows the same traffic. Point your application DNS names at your ingress. For public access from arbitrary clients, a public load balancer can forward to the two hosts from its scoped source addresses. [Network checklist](docs/PREREQUISITES.md#bare-metal-network-checklist)
+
+```sh
+./uncloudctl bare-metal
+```
+
+For a readiness check before installing, run `./uncloudctl bare-metal COMPANY --preflight-only`. Replace `COMPANY` with your installation name. [Existing-server installation guide](docs/INSTALLATION.md#install-on-existing-machines)
+
+## Create two Google Cloud VMs
+
+Use a billed Google Cloud project with Compute Engine enabled and one free VPC network slot. Run the wizard, sign in to Google, select the project, and choose the two VM zones and sizes. The installer creates the infrastructure, deploys the application and verifies both servers. [Google Cloud prerequisites](docs/PREREQUISITES.md)
 
 ```sh
 ./uncloudctl up
 ```
 
-The wizard signs you into Google, lets you select your project, zones and server
-sizes, and asks for DNS, VPN and deployment settings. Enter your account ID and
-paste the token at the hidden prompt. The installer fetches the configuration,
-administrator email and master key directly from your Trust account, checks SMTP,
-and provisions and verifies two Ubuntu servers.
+## After installation
 
-Grafana uses `https://grafana-cl-COMPANY.DNS_ZONE` automatically. The installer
-also allowlists `88.81.117.228/32` and `185.88.0.182/32` for CertLocker update and
-monitoring access without prompting.
+Keep the installer checkout and its controller state for maintenance. Use the front-office, backoffice and Grafana URLs from your site configuration. Grafana access is restricted to the allowed monitoring sources.
 
-Google installations generate a dedicated SSH provisioning key for each install
-and reuse it on resume. Both SSH fields in Install setup are optional for GCP.
-If you supply a username and PEM, both Google servers also authorize its public
-key. For existing servers, supply their authorized SSH identity in Install setup.
+| Task | Command |
+| --- | --- |
+| Check an interrupted Google installation | `./uncloudctl check --config uncloud/environments/COMPANY.json`, then follow the reported recovery command |
+| Continue an interrupted existing-server installation | `./uncloudctl bare-metal COMPANY --continue` |
+| Preview an application update on either platform | Pull the latest installer, then run `./uncloudctl update COMPANY --plan` |
+| Apply the application update | `./uncloudctl update COMPANY` |
 
-For unattended setup, use `--account-id` or `CERTLOCKER_ACCOUNT_ID` and inject
-`TRUST_TOKEN` or `CERTLOCKER_TOKEN` through your secret manager. Trust includes release image access in the installation configuration. The installer reads it automatically. See the [prerequisites](docs/PREREQUISITES.md).
-
-## Existing servers on a private network
-
-Choose **GENERIC** in Trust Install setup and enter both management IPv4 addresses and the SSH username and key already authorized on both servers. Connect your installer workstation to the customer network or VPN. The readiness check and the installer retrieve the addresses and SSH identity using your Trust account ID and hidden token. They verify SSH to both servers and test UDP/51820 between the two peers before a fresh installation. We recommend 8 GiB RAM per server for the full stack.
-
-```sh
-./uncloudctl bare-metal COMPANY --preflight-only
-./uncloudctl bare-metal COMPANY
-./uncloudctl update COMPANY --plan
-./uncloudctl update COMPANY
-./uncloudctl bare-metal uninstall COMPANY
-```
-
-The [illustrated prerequisites](docs/PREREQUISITES.md) cover SSH, memory, peer routing, ingress, DNS and image access. Follow the [bare-metal installation steps](docs/INSTALLATION.md#install-on-existing-machines) once both hosts pass.
-
-## Google installation state and recovery
-
-Company settings are generated under `uncloud/environments/COMPANY.json` and kept
-out of Git. The included `releases/current.json` pins the approved `v1.1.30`
-release; its checksum is verified and the selected release is saved for retries.
-
-If setup stops:
-
-```sh
-./uncloudctl check
-./uncloudctl resume
-```
-
-With several installations, specify `--config uncloud/environments/COMPANY.json`.
-Read the [installation manual](docs/INSTALLATION.md) for prerequisites, setup,
-recovery and removal. `./prepare-controller` optionally prepares the packaged
-Linux toolchain ahead of time; `up` selects it automatically when needed.
-
-This public repository contains the customer installation flow. Internal
-application release tooling, live inventories, credentials and operational
-history are excluded.
+The [release manifest](releases/current.json) identifies the application build shipped with this checkout. The installer verifies its checksum and preserves the selected build for retries. For removal, follow the procedure for your platform. [Update and removal instructions](docs/INSTALLATION.md)

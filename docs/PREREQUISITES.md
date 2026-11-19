@@ -1,19 +1,19 @@
 # Before you install CertLocker
 
-| Prepare | Google Cloud | Existing servers (bare metal or private VMs) |
+| Prepare | Google Cloud | Existing servers (physical hosts or cloud VMs) |
 | --- | --- | --- |
-| Workstation | macOS or Linux with a working Google login and access to the project | macOS or Linux with OpenSSH and a route to both management addresses. Connect the customer VPN first. |
+| Workstation | macOS or Linux with a working Google login and access to the project | macOS or Linux with OpenSSH and a route to both management addresses. Use the internet, a routed private network or a VPN, according to how you reach the hosts. |
 | Machines | A billed project with Compute Engine enabled. Allow the installer to create two VMs, disks, addresses, networks and firewall rules in separate zones. Default per VM is 2 vCPUs, 8 GiB RAM and a 100 GiB boot disk. | Two dedicated Ubuntu 24.04 **amd64** hosts with distinct machine IDs. Choose your own instance size. We recommend **8 GiB RAM per host** for the full stack. On hosts below 6 GiB the installer sets smaller Java heap limits for the application services. Allow headroom for monitoring, PostgreSQL and concurrent JVM startup during an update. Size disk for application images, PostgreSQL and logs. Provision a non-root user with passwordless sudo on both. |
 | SSH | The installer generates a key per installation. You can also authorize a customer key on both VMs. | Both hosts must already authorize the public half of the same provisioning key. Have the matching unencrypted private key available for Trust Install setup. |
-| Routing | The installer creates the project networking. Prepare the operator and monitoring VPN egress IPv4 addresses. | Prepare SSH IPv4 addresses, the VPN source as seen by each host and the internal DNS or load-balancer addresses. See the network checklist below. |
-| DNS and TLS | Customer Cloudflare zone with DNS Edit and Zone Read for DNS-01. The default public routing also requires paid Cloudflare Load Balancing, Zone Load Balancers Edit and Account Load Balancing: Monitors and Pools Edit. | Customer Cloudflare zone with DNS Edit and Zone Read for DNS-01. Your private DNS and load balancer serve the application names. |
+| Routing | The installer creates the project networking. Prepare the operator and monitoring VPN egress IPv4 addresses. | Prepare both SSH IPv4 addresses, the workstation source address as seen by each host, and your client or load-balancer source ranges. Allow TCP 80 and 443 to both hosts. See the network checklist below. |
+| DNS and TLS | Customer Cloudflare zone with DNS Edit and Zone Read for DNS-01. The default public routing also requires paid Cloudflare Load Balancing, Zone Load Balancers Edit and Account Load Balancing: Monitors and Pools Edit. | Customer Cloudflare zone with DNS Edit and Zone Read for DNS-01. Configure public or internal DNS for your application entry point. |
 | Image access | Included in your hosted Trust installation config | Included in your hosted Trust installation config |
 
-The optional bare-metal readiness check uses the same Trust account ID and hidden token as installation. To run the check directly on Linux, use Python 3.10+ with `cryptography`, OpenSSH, `findmnt` and a memory-backed `/dev/shm` for the temporary key. On macOS or when the native tools are missing, the launcher uses the packaged Linux controller through Docker. The controller needs a VPN route to both hosts.
+The optional bare-metal readiness check uses the same Trust account ID and hidden token as installation. To run the check directly on Linux, use Python 3.10+ with `cryptography`, OpenSSH, `findmnt` and a memory-backed `/dev/shm` for the temporary key. On macOS or when the native tools are missing, the launcher uses the packaged Linux controller through Docker. The controller must be able to SSH to both hosts over their public or private IPv4 addresses.
 
 ## Prepare the Trust installation
 
-Sign in as a **super user**. Select your display name in the header to open **User Details**, then choose **Install setup** at the bottom left. The following screenshots use the mock server and example customer data. [Open Trust](https://trust.certlocker.io)
+Sign in as a **super user**. Select your display name in the header to open **User Details**, then choose **Install setup** at the bottom left. The screenshots use example customer details. [Open Trust](https://trust.certlocker.io)
 
 <img src="images/install-account-menu.png" width="720" alt="Trust header with the signed-in user's display name">
 
@@ -49,9 +49,9 @@ Sign in as a **super user**. Select your display name in the header to open **Us
 
    </details>
 
-3. **Enter the site settings.** Select development or production. For GENERIC, the installer discovers and checks peer addresses over SSH. GCP supplies the private addresses. List the VPN egress IPv4 addresses allowed to access monitoring and the private ingress networks used by your clients or load balancer. The controller also discovers its own SSH source on each server. Enter the ACME contact, company account domain, administrator email, display name and initial password. Leaving the password blank enables the installer's hidden prompt. Trust stores a supplied password in a separate group secret.
+3. **Enter the site settings.** Select development or production. For GENERIC, the installer discovers and checks peer addresses over SSH. GCP supplies the private addresses. List the VPN egress IPv4 addresses allowed to access monitoring and the source networks used by your clients or load balancer. The controller also discovers its own SSH source on each server. Enter the ACME contact, company account domain, administrator email, display name and initial password. Leaving the password blank enables the installer's hidden prompt. Trust stores a supplied password in a separate group secret.
 
-   <img src="images/install-site.png" width="480" alt="Mock site settings showing VPN networks, private ingress, ACME contact and initial administrator fields">
+   <img src="images/install-site.png" width="480" alt="Mock site settings showing VPN networks, application ingress, ACME contact and initial administrator fields">
 
 4. **Enter the application SMTP settings.** Have the SMTP host, port, username and password ready. Match the provider's TLS mode, typically STARTTLS on 587 or implicit TLS on 465. For Gmail, use the full mailbox address and an [App Password](https://myaccount.google.com/apppasswords).
 
@@ -81,13 +81,13 @@ Have the ACME contact email, company domain, administrator display name, and fro
 
 | Connection | Requirement |
 | --- | --- |
-| Controller to both hosts | TCP 22 for SSH and TCP 80/443 for origin verification. A management address can be a VPN-routed floating IP. Keep the actual SSH source allowed for the duration of the installation. |
+| Controller to both hosts | TCP 22 for SSH and TCP 80/443 for origin verification. Use a public IPv4 address or a reachable private IPv4 address. Keep the actual SSH source allowed for the duration of the installation. |
 | Host to host | UDP 51820 both ways on the fixed peer addresses. On each host, the route to the other peer must select its own fixed address as the source. The installer checks for conflicts with the private mesh `10.210.0.0/16` and exchanges test datagrams before fresh enrollment. |
-| Private users and load balancer to both hosts | Allow TCP 80/443 from your client networks or load balancer. Pass additional source networks with `--ingress-cidr`. Supply individual monitoring VPN egress IPs with `--vpn-ip`. For Grafana, use a route that preserves an allowlisted source. |
-| Private DNS | Route the front-office, backoffice and Grafana names to your internal entry point. For HA, configure the load balancer to check HTTPS `/health/ready` with the application hostname, and preserve session affinity for browser traffic. |
-| Outbound | Allow DNS, OS package and mesh downloads, container registries, hosted Trust, Cloudflare, the ACME service and the configured SMTP endpoint. DNS-01 validates the public TXT challenge while application traffic stays private. |
+| Application clients or load balancer to both hosts | Open inbound TCP 80 and 443 on both hosts in provider security groups and upstream firewalls. Enter the client or load-balancer source ranges in Trust for the host firewall. A public load balancer can accept internet traffic and forward it from scoped source ranges. Pass additional source networks with `--ingress-cidr`. Supply individual monitoring VPN egress IPs with `--vpn-ip`. For Grafana, use a route that preserves an allowlisted source. |
+| DNS | Point front-office and backoffice names at your public or private entry point. Point Grafana at an origin reachable from the allowed monitoring sources. For HA, configure the load balancer to check HTTPS `/health/ready` with the application hostname, and preserve session affinity for browser traffic. |
+| Outbound | Allow DNS, OS package and mesh downloads, container registries, hosted Trust, Cloudflare, the ACME service and the configured SMTP endpoint. ACME DNS-01 validates the public TXT challenge for either routing configuration. |
 
-On reused lab machines, inspect existing inbound rules with `sudo ufw status verbose`. Remove obsolete public SSH, Apache and bastion rules after confirming that your management source has its own SSH rule. The hardening check rejects unexpected public access.
+On existing servers, inspect existing inbound rules with `sudo ufw status verbose`. Remove obsolete public SSH, Apache and bastion rules after confirming that your management source has its own SSH rule. The hardening check rejects unexpected public access.
 
 For a rolling update, route clients to both healthy origins through a load balancer with HTTPS readiness checks. Duplicate hosts-file entries only allow manual origin testing. Keep the installer checkout, generated inventory and controller state available for updates and uninstall. Install from a workstation with access to the Trust instance that issued the setup record and ensure both hosts can reach the signed Ubuntu archive or the fallback mirror at mirrors.edge.kernel.org.
 

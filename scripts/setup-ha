@@ -272,7 +272,7 @@ def run_setup(argv, key_access):
     bare_metal = '--bare-metal' in argv
     parser = argparse.ArgumentParser(
         prog='uncloudctl bare-metal' if bare_metal else None,
-        description='Install on two existing Ubuntu servers over a private network.' if bare_metal else __doc__,
+        description='Install on two existing Ubuntu servers reachable by SSH over public or private IPv4.' if bare_metal else __doc__,
         allow_abbrev=not bare_metal)
 
     parser.add_argument('company', nargs='?', help='Company inventory slug, e.g. acme')
@@ -280,7 +280,7 @@ def run_setup(argv, key_access):
     parser.add_argument('--preflight-only', action='store_true', help='Check both existing servers using the SSH identity from Trust Install setup')
     parser.add_argument('--peer-1', help='Set the first server WireGuard IPv4')
     parser.add_argument('--peer-2', help='Set the second server WireGuard IPv4')
-    parser.add_argument('--ingress-cidr', action='append', help='Additional private ingress source for HTTP and HTTPS, such as a load balancer')
+    parser.add_argument('--ingress-cidr', action='append', help='Client or load-balancer source CIDR allowed on TCP ports 80 and 443')
     parser.add_argument("server_1", nargs='?', help='First server IPv4, optional when saved in Trust Install setup')
     parser.add_argument("server_2", nargs='?', help='Second server IPv4, optional when saved in Trust Install setup')
     parser.add_argument("--config", type=Path, help="Optional non-secret installation JSON")
@@ -348,7 +348,7 @@ def run_setup(argv, key_access):
         from certlocker_gateway import operator_gateway
         os.environ['CERTLOCKER_INSTALL_TRUST_URL'] = operator_gateway(args.trust_url)
     if not args.bare_metal and (args.preflight_only or args.peer_1 or args.peer_2 or args.ingress_cidr):
-        parser.error('Readiness, peer and private ingress options require bare-metal')
+        parser.error('Readiness, peer and ingress options require bare-metal')
     from uncloud_terminal import can_prompt, prompt_line
     interactive = can_prompt(args.non_interactive)
     if args.bare_metal and not args.company and not args.config:
@@ -386,7 +386,7 @@ def run_setup(argv, key_access):
         if (config.get('hosting', {}).get('provider') == 'google' or config.get('registry_mode', 'ghcr') != 'ghcr'
                 or config.get('runtime_backend', 'host') != 'host'
                 or args.cloudflare_load_balancing or config.get('cloudflare_load_balancing')):
-            raise ValueError('Bare-metal uses GHCR and customer-managed private routing')
+            raise ValueError('Bare-metal uses GHCR and customer-managed routing')
         config['cloudflare_load_balancing'] = False
         config.setdefault('certificate_mode', 'customer')
         for name, override in zip(NAMES, (args.peer_1, args.peer_2)):
@@ -396,7 +396,7 @@ def run_setup(argv, key_access):
         ingress = args.ingress_cidr or config.get('ingress_cidrs', [])
         config['ingress_cidrs'] = [str(ipaddress.IPv4Network(cidr)) for cidr in ingress]
         if '0.0.0.0/0' in config['ingress_cidrs']:
-            raise ValueError('Private ingress requires scoped source networks')
+            raise ValueError('HTTP and HTTPS ingress requires scoped source networks')
         args.manifest_file = args.manifest_file or ROOT / 'releases/current.json'
     if args.project:
         config['google_project'] = args.project
